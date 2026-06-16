@@ -9,7 +9,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true # Убираем варнинг с Node.js от 2026 года
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
     - name: Checkout code
@@ -24,14 +24,13 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y git zip unzip openjdk-17-jdk autoconf libtool pkg-config zlib1g-dev libncurses5-dev libgdbm-dev libnss3-dev libssl-dev libreadline-dev libffi-dev libsqlite3-dev tk-dev libgdbm-compat-dev liblzma-dev lzma libmpv-dev
-        # Скачиваем чистый Buildozer и сопутствующие утилиты прямо в облако
         pip install --user --upgrade buildozer cython virtualenv requests python-mpv jinja2 pkginfo tqdm
 
     - name: Build Android APK with Pure Buildozer
       run: |
         export PATH=$PATH:$HOME/.local/bin
-        # Запускаем сборку напрямую, автоматически со всем соглашаясь
-        yes | buildozer android debug
+        # Запускаем чистую сборку! Buildozer сам примет лицензии из файла spec!
+        buildozer android debug
         
     - name: Upload Premium APK Artifact
       uses: actions/upload-artifact@v4
