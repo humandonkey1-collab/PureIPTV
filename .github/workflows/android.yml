@@ -1,0 +1,37 @@
+name: Build Pure IPTV Premium APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install Buildozer dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y git zip unzip openjdk-17-jdk autoconf libtool pkg-config zlib1g-dev libncurses5-dev libgdbm-dev libnss3-dev libssl-dev libreadline-dev libffi-dev libsqlite3-dev tk-dev libgdbm-compat-dev liblzma-dev lzma libmpv-dev
+        pip install --user --upgrade buildozer cython virtualenv
+
+    - name: Build Android APK
+      run: |
+        export PATH=$PATH:$HOME/.local/bin
+        yes | buildozer android debug
+
+    - name: Upload APK
+      uses: actions/upload-artifact@v4
+      with:
+        name: Pure-IPTV-Premium-APK
+        path: bin/*.apk
+        
