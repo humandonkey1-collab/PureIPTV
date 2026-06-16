@@ -1,7 +1,7 @@
 [app]
 title = Pure IPTV Premium
 package.name = pureiptvpremium
-package.domain = org.opensource
+package.domain = org.humandonkey.pureiptv
 source.dir = .
 source.include_exts = py,qml,png,db
 version = 2.0.0
