@@ -5,16 +5,18 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      # Обновлено до v4
       - name: Checkout Code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install System Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y libmpv-dev libegl1-mesa-dev
 
+      # Обновлено до v5
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
@@ -23,19 +25,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install pyside6 shiboken6 requests python-mpv
 
+      # Обновлено до v4
       - name: Set up Java 17
-        uses: actions/setup-java@v3
+        uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
 
       - name: Build with PySide6 Deploy
         run: |
-          # Пытаемся собрать APK
+          # Запуск сборки APK
           pyside6-android-deploy --spec pysidedeploy.spec
 
+      # Обновлено до v4 (Исправляет твою ошибку!)
       - name: Upload APK
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: PureIPTV-Premium
           path: "*.apk"
+          compression-level: 0 # Для APK лучше без доп. сжатия
