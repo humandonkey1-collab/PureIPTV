@@ -29,7 +29,7 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Build APK in Virtual Environment
+      - name: Build APK
         run: |
           python -m venv venv
           source venv/bin/activate
@@ -46,17 +46,27 @@ jobs:
           SHIBOKEN_PATH=$(readlink -f wheels_dir/shiboken6-*.whl)
           NDK_PATH=$(find $ANDROID_SDK_ROOT/ndk -maxdepth 1 -type d | tail -n 1)
 
+          # Запуск сборки
           pyside6-android-deploy \
             -c pysidedeploy.spec \
             --wheel-pyside "$PYSIDE_PATH" \
             --wheel-shiboken "$SHIBOKEN_PATH" \
             --sdk-path "$ANDROID_SDK_ROOT" \
             --ndk-path "$NDK_PATH"
+          
+          # ОТЛАДКА: Показываем все файлы, чтобы найти APK
+          echo "--- Структура файлов после сборки ---"
+          ls -R
+          
+          # Ищем путь к APK и сохраняем его в переменную для следующего шага
+          APK_PATH=$(find . -name "*.apk" | head -n 1)
+          echo "Found APK at: $APK_PATH"
+          echo "APK_FULL_PATH=$APK_PATH" >> $GITHUB_ENV
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: PureIPTV-Premium
-          # ИСПРАВЛЕННЫЙ ПУТЬ: ищем APK во всех подпапках
-          path: "**/*.apk"
+          # Используем путь, найденный командой find
+          path: ${{ env.APK_FULL_PATH }}
           if-no-files-found: error
