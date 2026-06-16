@@ -26,7 +26,6 @@ jobs:
       - name: Install Build Tools
         run: |
           python -m pip install --upgrade pip
-          # Устанавливаем PySide6 и специальную утилиту qtpip
           pip install pyside6 shiboken6 requests python-mpv qtpip
           pip install jinja2 pkginfo tqdm "packaging==24.1"
 
@@ -36,17 +35,25 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      # АВТОМАТИЧЕСКОЕ СКАЧИВАНИЕ ANDROID WHEELS ЧЕРЕЗ QTPIP
       - name: Download Android Wheels
         run: |
-          mkdir -p wheels
-          # Скачиваем PySide6 и Shiboken6 для Android aarch64
-          qtpip download PySide6 --android --arch aarch64 --dest wheels
-          qtpip download shiboken6 --android --arch aarch64 --dest wheels
+          mkdir -p wheels_dir
+          # Скачиваем библиотеки
+          python -m qtpip download PySide6 --android --arch aarch64 --dest wheels_dir
+          python -m qtpip download shiboken6 --android --arch aarch64 --dest wheels_dir
           
-          # Находим пути к скачанным файлам и сохраняем в переменные окружения
-          echo "WHEEL_PYSIDE=$(ls wheels/PySide6*.whl | head -n 1)" >> $GITHUB_ENV
-          echo "WHEEL_SHIBOKEN=$(ls wheels/shiboken6*.whl | head -n 1)" >> $GITHUB_ENV
+          # Проверяем, что скачалось (увидим в логах)
+          ls -l wheels_dir
+          
+          # Записываем пути. Используем wildcard, так как версии могут меняться
+          PYSIDE_WHEEL=$(realpath wheels_dir/PySide6*.whl | head -n 1)
+          SHIBOKEN_WHEEL=$(realpath wheels_dir/shiboken6*.whl | head -n 1)
+          
+          if [ -z "$PYSIDE_WHEEL" ]; then echo "Error: PySide6 wheel not found"; exit 1; fi
+          if [ -z "$SHIBOKEN_WHEEL" ]; then echo "Error: Shiboken6 wheel not found"; exit 1; fi
+          
+          echo "WHEEL_PYSIDE=$PYSIDE_WHEEL" >> $GITHUB_ENV
+          echo "WHEEL_SHIBOKEN=$SHIBOKEN_WHEEL" >> $GITHUB_ENV
 
       - name: Set Android Environment
         run: |
@@ -56,13 +63,13 @@ jobs:
 
       - name: Build APK
         run: |
-          # Запускаем сборку с использованием путей, найденных qtpip
+          # Используем переменные, которые мы проверили шагом выше
           pyside6-android-deploy \
             --spec pysidedeploy.spec \
-            --wheel-pyside ${{ env.WHEEL_PYSIDE }} \
-            --wheel-shiboken ${{ env.WHEEL_SHIBOKEN }} \
-            --sdk-path $ANDROID_SDK_ROOT \
-            --ndk-path $ANDROID_NDK_PATH
+            --wheel-pyside "${{ env.WHEEL_PYSIDE }}" \
+            --wheel-shiboken "${{ env.WHEEL_SHIBOKEN }}" \
+            --sdk-path "$ANDROID_SDK_ROOT" \
+            --ndk-path "$ANDROID_NDK_PATH"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
