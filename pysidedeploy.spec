@@ -5,7 +5,9 @@ version = 1.0.0
 entrypoint = main.py
 input_file = main.py
 include_files = main.py,main.qml,libmpv.so
-# Зависимости возвращены сюда
+
+[python]
+# Это две самые важные строки для исправления ошибки split()
 python_depends = requests,urllib3,idna,charset-normalizer,certifi,python-mpv
 android_packages = requests,urllib3,idna,charset-normalizer,certifi,python-mpv
 
