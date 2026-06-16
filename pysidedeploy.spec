@@ -7,9 +7,12 @@ input_file = main.py
 include_files = main.py,main.qml
 
 [python]
-# Новая версия сборщика ищет зависимости здесь
 python_depends = requests,urllib3,idna,charset-normalizer,certifi,python-mpv
 android_packages = requests,urllib3,idna,charset-normalizer,certifi,python-mpv
+
+[qt]
+# Принудительно включаем модули, чтобы статический анализатор не тупил
+extra_modules = QtGui,QtQml,QtCore,QtQuick,QtLayouts,QtMultimedia
 
 [android]
 permissions = INTERNET,READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE
