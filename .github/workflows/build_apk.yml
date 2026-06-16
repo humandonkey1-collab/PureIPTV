@@ -16,18 +16,12 @@ jobs:
       - name: Install System Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libmpv-dev libegl1-mesa-dev wget unzip
+          sudo apt-get install -y libmpv-dev libegl1-mesa-dev wget unzip realpath
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-
-      - name: Install Build Tools
-        run: |
-          python -m pip install --upgrade pip
-          pip install pyside6 shiboken6 requests python-mpv qtpip
-          pip install jinja2 pkginfo tqdm "packaging==24.1"
 
       - name: Set up Java 17
         uses: actions/setup-java@v4
@@ -35,32 +29,39 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Download Android Wheels
+      - name: Build APK in Virtual Environment
         run: |
+          # Создаем и активируем виртуальное окружение
+          python -m venv venv
+          source venv/bin/activate
+          
+          # Устанавливаем зависимости внутри venv
+          pip install --upgrade pip
+          pip install pyside6==6.7.2 shiboken6==6.7.2 requests python-mpv qtpip
+          pip install jinja2 pkginfo tqdm "packaging==24.1"
+          
+          # Скачиваем wheels
           mkdir -p wheels_dir
           python -m qtpip download PySide6 --android --arch aarch64 --dest wheels_dir
           python -m qtpip download shiboken6 --android --arch aarch64 --dest wheels_dir
-          PYSIDE_WHEEL=$(realpath wheels_dir/PySide6*.whl | head -n 1)
-          SHIBOKEN_WHEEL=$(realpath wheels_dir/shiboken6*.whl | head -n 1)
-          echo "WHEEL_PYSIDE=$PYSIDE_WHEEL" >> $GITHUB_ENV
-          echo "WHEEL_SHIBOKEN=$SHIBOKEN_WHEEL" >> $GITHUB_ENV
+          
+          # Получаем ЧИСТЫЕ пути (исправляет ошибку Wheel corrupted)
+          PYSIDE_WHEEL=$(realpath wheels_dir/PySide6-*.whl)
+          SHIBOKEN_WHEEL=$(realpath wheels_dir/shiboken6-*.whl)
+          
+          echo "Using PySide Wheel: $PYSIDE_WHEEL"
+          echo "Using Shiboken Wheel: $SHIBOKEN_WHEEL"
 
-      - name: Set Android Environment
-        run: |
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
+          # Находим NDK
           NDK_PATH=$(find $ANDROID_SDK_ROOT/ndk -maxdepth 1 -type d | tail -n 1)
-          echo "ANDROID_NDK_PATH=$NDK_PATH" >> $GITHUB_ENV
 
-      # ПРИНУДИТЕЛЬНЫЙ ОТВЕТ НА ВОПРОСЫ СБОРЩИКА
-      - name: Build APK
-        run: |
-          # Команда 'yes' будет бесконечно слать 'y' и Enter в консоль сборщика
-          yes | pyside6-android-deploy \
+          # Запускаем сборку БЕЗ 'yes |', так как в venv он не должен спрашивать
+          pyside6-android-deploy \
             -c pysidedeploy.spec \
-            --wheel-pyside "${{ env.WHEEL_PYSIDE }}" \
-            --wheel-shiboken "${{ env.WHEEL_SHIBOKEN }}" \
+            --wheel-pyside "$PYSIDE_WHEEL" \
+            --wheel-shiboken "$SHIBOKEN_WHEEL" \
             --sdk-path "$ANDROID_SDK_ROOT" \
-            --ndk-path "$ANDROID_NDK_PATH"
+            --ndk-path "$NDK_PATH"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
