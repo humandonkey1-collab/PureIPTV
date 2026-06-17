@@ -7,7 +7,6 @@ input_file = main.py
 include_files = main.py,main.qml,libmpv.so
 
 [python]
-# Это две самые важные строки для исправления ошибки split()
 python_depends = requests,urllib3,idna,charset-normalizer,certifi,python-mpv
 android_packages = requests,urllib3,idna,charset-normalizer,certifi,python-mpv
 
@@ -15,6 +14,7 @@ android_packages = requests,urllib3,idna,charset-normalizer,certifi,python-mpv
 extra_modules = QtGui,QtQml,QtCore,QtQuick,QtLayouts,QtMultimedia
 
 [android]
+mode = release
 name = PureIPTV
 permissions = INTERNET,READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE
 theme = @android:style/Theme.NoTitleBar.Fullscreen
