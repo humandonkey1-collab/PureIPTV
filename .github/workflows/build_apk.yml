@@ -11,7 +11,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y wget unzip jq curl libmpv-dev libdouble-conversion3 libxcb-cursor0 libpcre2-16-0 libfontconfig1 libx11-xcb1 libicu-dev libxkbcommon-x11-0 libdbus-1-3 lld libssl-dev autoconf automake libtool
 
-      # ФИКС ПУТЕЙ ДЛЯ BUILDOZER
+      # ФИКС: Создаем ссылку, чтобы Buildozer нашел sdkmanager
       - name: Fix Android SDK Layout
         run: |
           sudo ln -s $ANDROID_HOME/cmdline-tools/latest $ANDROID_HOME/tools
@@ -47,14 +47,8 @@ jobs:
           SHIBOKEN_PATH=$(readlink -f wheels_dir/shiboken6-*.whl)
           NDK_PATH=$(find $ANDROID_SDK_ROOT/ndk -maxdepth 1 -type d | tail -n 1)
 
-          # СБОРКА
-          yes | pyside6-android-deploy \
-            --init \
-            --wheel-pyside "$PYSIDE_PATH" \
-            --wheel-shiboken "$SHIBOKEN_PATH" \
-            --sdk-path "$ANDROID_SDK_ROOT" \
-            --ndk-path "$NDK_PATH"
-
+          # СБОРКА БЕЗ --INIT! 
+          # Наш spec-файл уже готов и лежит в репозитории.
           yes | pyside6-android-deploy \
             -v \
             -c pysidedeploy.spec \
