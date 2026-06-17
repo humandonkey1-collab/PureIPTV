@@ -7,12 +7,12 @@ input_file = main.py
 include_files = main.py,main.qml,libmpv.so
 
 [python]
-# Критически важно для исправления ошибки split()
+# Ключ для установки зависимостей внутри Android
 android_packages = requests,urllib3,idna,charset-normalizer,certifi,python-mpv
 python_depends = requests,urllib3,idna,charset-normalizer,certifi,python-mpv
 
 [qt]
-# Принудительно включаем модули для линтера
+# Принудительно подключаем модули
 modules = Core,Gui,Qml,Quick,Layouts,Multimedia
 
 [android]
