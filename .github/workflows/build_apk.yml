@@ -41,7 +41,7 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Fix Android SDK layout
+      - name: Fix Android SDK layout (for buildozer compatibility)
         run: |
           sudo ln -sf $ANDROID_HOME/cmdline-tools/latest $ANDROID_HOME/tools
 
@@ -68,14 +68,19 @@ jobs:
           wget https://download.qt.io/official_releases/QtForPython/shiboken6/shiboken6-6.8.0-6.8.0-cp311-cp311-android_aarch64.whl
           cd ..
 
-      - name: Locate NDK path
-        id: paths
+      - name: Fix Android SDK and NDK for Buildozer
         run: |
-          echo "NDK_PATH=$(find $ANDROID_SDK_ROOT/ndk -maxdepth 1 -type d | tail -n 1)" >> $GITHUB_OUTPUT
-
-      - name: Accept Android SDK licenses
-        run: |
-          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses
+          # Устанавливаем конкретную версию NDK и build-tools
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+            "build-tools;33.0.0" \
+            "platform-tools" \
+            "platforms;android-33" \
+            "ndk;27.3.13750724"
+          # Создаём симлинк для aidl (если отсутствует)
+          sudo ln -sf $ANDROID_HOME/build-tools/33.0.0/aidl /usr/local/bin/aidl || true
+          # Явно экспортируем переменные для buildozer
+          echo "export ANDROID_SDK_ROOT=$ANDROID_HOME" >> $GITHUB_ENV
+          echo "export ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.3.13750724" >> $GITHUB_ENV
 
       - name: Build APK with pyside6-android-deploy
         run: |
@@ -88,8 +93,8 @@ jobs:
             -c pysidedeploy.spec \
             --wheel-pyside "$PYSIDE_PATH" \
             --wheel-shiboken "$SHIBOKEN_PATH" \
-            --sdk-path "$ANDROID_SDK_ROOT" \
-            --ndk-path "${{ steps.paths.outputs.NDK_PATH }}"
+            --sdk-path "$ANDROID_HOME" \
+            --ndk-path "$ANDROID_HOME/ndk/27.3.13750724"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
