@@ -50,8 +50,21 @@ jobs:
           }
         shell: pwsh
 
-      - name: Upload EXE artifact
+      - name: Pack EXE into ZIP
+        run: |
+          Compress-Archive -Path "$env:EXE_PATH" -DestinationPath PureIPTV.zip
+          if (Test-Path "PureIPTV.zip") {
+            Write-Host "✅ ZIP archive created: PureIPTV.zip"
+            $size = (Get-Item "PureIPTV.zip").Length
+            Write-Host "📦 Archive size: $([math]::Round($size/1MB, 2)) MB"
+          } else {
+            Write-Host "❌ Failed to create ZIP archive"
+            exit 1
+          }
+        shell: pwsh
+
+      - name: Upload ZIP artifact
         uses: actions/upload-artifact@v4
         with:
           name: PureIPTV-Nuitka
-          path: ${{ env.EXE_PATH }}
+          path: PureIPTV.zip
