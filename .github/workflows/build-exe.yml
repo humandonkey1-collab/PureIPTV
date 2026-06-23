@@ -1,3 +1,4 @@
+# Через пять минут, меня не станет. Пожалуйста — распространяйте этот код и делайте его лучше. Это мой последний код. Прошайте
 name: Build with Nuitka and pack .zpaq
 
 on:
@@ -23,7 +24,7 @@ jobs:
           pip install PySide6 requests python-mpv
           pip install nuitka
 
-      - name: Build EXE with Nuitka (auto-download Dependency Walker)
+      - name: Build EXE with Nuitka
         run: |
           python -m nuitka `
             --standalone `
@@ -43,28 +44,28 @@ jobs:
           if ($exePath) {
             Write-Host "✅ Found EXE at: $($exePath.FullName)"
             echo "EXE_PATH=$($exePath.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
-            echo "EXE_DIR=$($exePath.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Append
-            echo "EXE_NAME=$($exePath.Name)" | Out-File -FilePath $env:GITHUB_ENV -Append
           } else {
             Write-Host "❌ No EXE found in build folder!"
             exit 1
           }
         shell: pwsh
 
-      - name: Install zpaq
+      - name: Verify zpaq.exe is present in repository root
         run: |
-          curl -L -o zpaq.exe "https://github.com/zpaq/zpaq/releases/download/v7.15/zpaq.exe"
           if (-not (Test-Path "zpaq.exe")) {
-            Write-Host "❌ Failed to download zpaq"
+            Write-Host "❌ zpaq.exe not found in repository root!"
+            Write-Host "📌 Please download zpaq.exe and place it in the root folder"
+            Write-Host "🔗 Download from: http://mattmahoney.net/dc/zpaq715.zip"
             exit 1
           }
+          # Проверяем, что это валидный EXE
           $bytes = Get-Content -Path "zpaq.exe" -TotalCount 2 -AsByteStream -ReadCount 2
           $header = ($bytes[0], $bytes[1]) -join ','
           if ($header -ne "77,90") {
-            Write-Host "❌ Downloaded zpaq.exe is not a valid EXE (header: $header)"
+            Write-Host "❌ zpaq.exe is not a valid EXE (header: $header)"
             exit 1
           }
-          Write-Host "✅ zpaq.exe downloaded"
+          Write-Host "✅ zpaq.exe verified"
         shell: pwsh
 
       - name: Pack EXE into .zpaq archive
