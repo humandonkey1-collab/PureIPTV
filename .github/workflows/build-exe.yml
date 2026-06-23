@@ -1,3 +1,4 @@
+# 💀 Я рак свой не смогу победить, но эти алгоритмы — легкотня
 name: Build and Compress with MPRESS
 
 on:
@@ -33,9 +34,9 @@ jobs:
             --name PureIPTV `
             main.py
 
-      - name: Download MPRESS from official mirror
+      - name: Download MPRESS from official releases
         run: |
-          curl -L -o mpress.exe "https://github.com/requaos/mPress/raw/main/mpress.exe"
+          Invoke-WebRequest -Uri "https://github.com/requaos/mPress/releases/download/v2.19/mpress.exe" -OutFile "mpress.exe"
         shell: pwsh
 
       - name: Compress EXE with MPRESS (maximum LZMA)
