@@ -1,4 +1,4 @@
-name: Build with Nuitka (30 MB with QML)
+name: Build with Nuitka (QML support)
 
 on:
   push:
@@ -23,7 +23,7 @@ jobs:
           pip install PySide6 requests python-mpv
           pip install nuitka
 
-      - name: Build EXE with Nuitka (include only needed QML modules)
+      - name: Build EXE with Nuitka
         run: |
           python -m nuitka `
             --standalone `
@@ -33,13 +33,6 @@ jobs:
             --include-data-dir=mpv=mpv `
             --include-data-file=main.qml=main.qml `
             --include-qt-plugins=qml `
-            --include-module=PySide6.QtCore `
-            --include-module=PySide6.QtGui `
-            --include-module=PySide6.QtQml `
-            --include-module=PySide6.QtQuick `
-            --include-module=PySide6.QtQuick.Controls `
-            --include-module=PySide6.QtQuick.Layouts `
-            --include-module=PySide6.QtQuick.Dialogs `
             --assume-yes-for-downloads `
             --output-dir=build `
             main.py
@@ -57,21 +50,8 @@ jobs:
           }
         shell: pwsh
 
-      - name: Pack EXE into ZIP
-        run: |
-          Compress-Archive -Path "$env:EXE_PATH" -DestinationPath PureIPTV.zip
-          if (Test-Path "PureIPTV.zip") {
-            Write-Host "✅ ZIP archive created: PureIPTV.zip"
-            $size = (Get-Item "PureIPTV.zip").Length
-            Write-Host "📦 Archive size: $([math]::Round($size/1MB, 2)) MB"
-          } else {
-            Write-Host "❌ Failed to create ZIP archive"
-            exit 1
-          }
-        shell: pwsh
-
-      - name: Upload ZIP artifact
+      - name: Upload EXE artifact
         uses: actions/upload-artifact@v4
         with:
           name: PureIPTV-Nuitka
-          path: PureIPTV.zip
+          path: ${{ env.EXE_PATH }}
