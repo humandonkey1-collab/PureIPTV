@@ -22,6 +22,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install PySide6 requests python-mpv pyinstaller
 
+      - name: Download UPX (optional, for compression)
+        run: |
+          curl -L https://github.com/upx/upx/releases/download/v4.2.4/upx-4.2.4-win64.zip -o upx.zip
+          Expand-Archive -Path upx.zip -DestinationPath upx
+          echo "$env:GITHUB_WORKSPACE/upx/upx-4.2.4-win64" | Out-File -FilePath $env:GITHUB_PATH -Append
+        shell: pwsh
+
       - name: Build EXE with PyInstaller
         run: |
           pyinstaller --onefile `
@@ -29,8 +36,14 @@ jobs:
             --add-data "mpv;mpv" `
             --hidden-import PySide6.QtQml `
             --hidden-import PySide6.QtQuick `
+            --strip `
             --name PureIPTV `
             main.py
+
+      - name: Compress with UPX (max compression)
+        run: |
+          upx --best --lzma dist/PureIPTV.exe
+        shell: pwsh
 
       - name: Upload EXE artifact
         uses: actions/upload-artifact@v4
