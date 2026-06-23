@@ -1,4 +1,5 @@
-name: Build and Compress with MPRESS
+# 💀 Я рак свой не смогу победить, но эти алгоритмы — легкотня
+name: Build with Nuitka and pack .zpaq
 
 on:
   push:
@@ -17,74 +18,74 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Python dependencies
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install PySide6 requests python-mpv pyinstaller
+          pip install PySide6 requests python-mpv
+          pip install nuitka
 
-      - name: Build EXE with PyInstaller (onedir, no compression)
+      - name: Build EXE with Nuitka
         run: |
-          pyinstaller --onedir `
-            --add-data "main.qml;." `
-            --add-data "mpv;mpv" `
-            --hidden-import PySide6.QtQml `
-            --hidden-import PySide6.QtQuick `
-            --strip `
-            --name PureIPTV `
+          python -m nuitka `
+            --standalone `
+            --onefile `
+            --enable-plugin=pyside6 `
+            --windows-console-mode=disable `
+            --include-data-dir=mpv=mpv `
+            --include-data-file=main.qml=main.qml `
+            --output-dir=build `
             main.py
 
-      - name: Verify MPRESS is present in repository root
+      - name: Find EXE file path
+        id: find_exe
         run: |
-          if (-not (Test-Path "mpress.exe")) {
-            Write-Host "❌ mpress.exe not found in repository root!"
-            Write-Host "📌 Please download mpress.exe and place it in the root folder of your repository"
-            Write-Host "🔗 Download from: https://www.matcode.com/mpress.exe"
+          $exePath = Get-ChildItem -Path build -Recurse -Filter "*.exe" | Select-Object -First 1
+          if ($exePath) {
+            Write-Host "✅ Found EXE at: $($exePath.FullName)"
+            echo "EXE_PATH=$($exePath.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+            echo "EXE_DIR=$($exePath.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+            echo "EXE_NAME=$($exePath.Name)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          } else {
+            Write-Host "❌ No EXE found in build folder!"
+            exit 1
+          }
+        shell: pwsh
+
+      - name: Install zpaq
+        run: |
+          # Скачиваем zpaq из официального релиза
+          curl -L -o zpaq.exe "https://github.com/zpaq/zpaq/releases/download/v7.15/zpaq.exe"
+          if (-not (Test-Path "zpaq.exe")) {
+            Write-Host "❌ Failed to download zpaq"
             exit 1
           }
           # Проверяем, что это валидный EXE
-          $bytes = Get-Content -Path "mpress.exe" -TotalCount 2 -AsByteStream -ReadCount 2
+          $bytes = Get-Content -Path "zpaq.exe" -TotalCount 2 -AsByteStream -ReadCount 2
           $header = ($bytes[0], $bytes[1]) -join ','
           if ($header -ne "77,90") {
-            Write-Host "❌ mpress.exe is not a valid EXE (header: $header)"
+            Write-Host "❌ Downloaded zpaq.exe is not a valid EXE (header: $header)"
             exit 1
           }
-          Write-Host "✅ mpress.exe verified"
+          Write-Host "✅ zpaq.exe downloaded"
         shell: pwsh
 
-      - name: Compress EXE with MPRESS (maximum LZMA)
+      - name: Pack EXE into .zpaq archive
         run: |
-          .\mpress.exe -s -b dist\PureIPTV\PureIPTV.exe
-        shell: pwsh
-
-      - name: Test EXE (check for Python DLL errors)
-        run: |
-          Write-Host "🧪 Testing PureIPTV.exe for Python DLL loading issues..."
-          $exePath = "dist\PureIPTV\PureIPTV.exe"
-          $output = & $exePath 2>&1
-          $exitCode = $LASTEXITCODE
-          
-          Write-Host "📄 Output:"
-          Write-Host $output
-          
-          $errorPattern = "Failed to load Python DLL|Invalid access to memory location|python311.dll"
-          if ($output -match $errorPattern) {
-            Write-Host "❌ Python DLL Error detected!"
-            Write-Host "🔍 Error details: $($output -match $errorPattern)"
-            exit 1
-          }
-          
-          if ($exitCode -ne 0) {
-            Write-Host "⚠️ EXE crashed with exit code $exitCode, but no Python DLL error found."
+          # Создаём архив с именем PureIPTV-Nuitka.zpaq
+          .\zpaq.exe a PureIPTV-Nuitka.zpaq "$env:EXE_PATH"
+          # Проверяем, что архив создался
+          if (Test-Path "PureIPTV-Nuitka.zpaq") {
+            Write-Host "✅ Archive created: PureIPTV-Nuitka.zpaq"
+            $size = (Get-Item "PureIPTV-Nuitka.zpaq").Length
+            Write-Host "📦 Archive size: $([math]::Round($size/1MB, 2)) MB"
           } else {
-            Write-Host "✅ EXE loaded Python DLL successfully and executed without fatal errors."
+            Write-Host "❌ Failed to create archive"
+            exit 1
           }
-          
-          Write-Host "🎉 Test passed! The EXE is safe to download."
         shell: pwsh
-        timeout-minutes: 2
 
-      - name: Upload EXE artifact
+      - name: Upload zpaq archive as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: PureIPTV-EXE
-          path: dist/PureIPTV/PureIPTV.exe
+          name: PureIPTV-Nuitka-zpaq
+          path: PureIPTV-Nuitka.zpaq
