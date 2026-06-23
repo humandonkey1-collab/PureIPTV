@@ -1,41 +1,69 @@
-name: Unzip and Clean
+name: Unpack Archive
 
 on:
-  push:                 # Запускается при пуше в любую ветку
-  workflow_dispatch:    # Можно запустить вручную
+  push:
+  workflow_dispatch:
 
 jobs:
-  unzip:
+  unpack:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Find and unzip .zip files
+      - name: Install dependencies
         run: |
-          # Ищем все .zip файлы в корне репозитория
-          for zipfile in *.zip; do
-            if [ -f "$zipfile" ]; then
-              echo "📦 Found: $zipfile"
-              # Распаковываем в папку с тем же именем (без .zip)
-              dirname="${zipfile%.zip}"
-              mkdir -p "$dirname"
-              unzip -q "$zipfile" -d "$dirname"
-              echo "✅ Extracted to: $dirname"
-              # Удаляем архив
-              rm -v "$zipfile"
-              echo "🗑️ Removed: $zipfile"
-            else
-              echo "❌ No .zip files found."
+          sudo apt-get update
+          sudo apt-get install -y zstd unrar
+
+      - name: Detect and extract archive
+        run: |
+          for archive in *.tar.zst *.tar.gz *.tar.xz *.tar.bz2 *.zip *.rar; do
+            if [ -f "$archive" ]; then
+              echo "📦 Found: $archive"
+              case "$archive" in
+                *.tar.zst)
+                  echo "🔍 Detected: tar.zst"
+                  tar -xf "$archive"
+                  rm -v "$archive"
+                  ;;
+                *.tar.gz)
+                  echo "🔍 Detected: tar.gz"
+                  tar -xzf "$archive"
+                  rm -v "$archive"
+                  ;;
+                *.tar.xz)
+                  echo "🔍 Detected: tar.xz"
+                  tar -xf "$archive"
+                  rm -v "$archive"
+                  ;;
+                *.tar.bz2)
+                  echo "🔍 Detected: tar.bz2"
+                  tar -xjf "$archive"
+                  rm -v "$archive"
+                  ;;
+                *.zip)
+                  echo "🔍 Detected: zip"
+                  unzip -q "$archive"
+                  rm -v "$archive"
+                  ;;
+                *.rar)
+                  echo "🔍 Detected: rar"
+                  unrar x -y "$archive"
+                  rm -v "$archive"
+                  ;;
+                *)
+                  echo "⚠️ Unknown format: $archive"
+                  ;;
+              esac
             fi
           done
 
-      - name: Commit and push changes (optional)
+      - name: Commit and push extracted files
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add .
-          git diff --staged --quiet || git commit -m "Auto-unzip and cleanup"
+          git diff --staged --quiet || git commit -m "📦 Auto-extract archive and cleanup"
           git push
-          
