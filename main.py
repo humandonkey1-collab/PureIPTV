@@ -3,10 +3,8 @@ import sys
 from ctypes import CDLL
 
 # --- MPV preload ---
-# Ищем папку MPV рядом со скриптом, скрипт можно класть куда угодно
 script_dir = os.path.dirname(os.path.abspath(__file__))
 
-# Пробуем несколько вариантов имени папки
 mpv_candidates = [
     os.path.join(script_dir, "MPV"),
     os.path.join(script_dir, "mpv"),
@@ -14,20 +12,16 @@ mpv_candidates = [
 ]
 mpv_path = next((p for p in mpv_candidates if os.path.isdir(p)), mpv_candidates[0])
 
-# Добавляем папку MPV в PATH, чтобы mpv нашёл все свои DLL
 os.environ["PATH"] = mpv_path + os.pathsep + os.environ.get("PATH", "")
 
-# Для Python 3.8+ на Windows нужно явно добавить директорию поиска DLL
 if sys.platform == "win32" and hasattr(os, "add_dll_directory"):
     try:
         os.add_dll_directory(mpv_path)
     except Exception:
         pass
 
-# Пробуем загрузить libmpv из локальной папки
 mpv_dll_loaded = False
-mpv_dll_names = ["libmpv-2.dll", "libmpv-1.dll", "mpv-2.dll", "mpv-1.dll"]
-for dll_name in mpv_dll_names:
+for dll_name in ["libmpv-2.dll", "libmpv-1.dll", "mpv-2.dll", "mpv-1.dll"]:
     dll_path = os.path.join(mpv_path, dll_name)
     if os.path.isfile(dll_path):
         try:
@@ -42,33 +36,39 @@ for dll_name in mpv_dll_names:
 if not mpv_dll_loaded:
     print(f"❌ MPV DLL не найдена в {mpv_path}, пробуем системный PATH")
 
-import requests
 import re
 import json
 import gzip
 import sqlite3
 import socket
-import locale
 import threading
 import urllib.parse
-from datetime import datetime
-from datetime import timezone
-from xml.etree import ElementTree
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
+from datetime import datetime
+from xml.etree import ElementTree
 import time
 
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtQml import QQmlApplicationEngine
-from PySide6.QtCore import QObject, Signal, Slot, Property, QThread, QAbstractListModel, qInstallMessageHandler, QTimer
+from PySide6.QtCore import (
+    QObject, Signal, Slot, Property, QThread,
+    QAbstractListModel, qInstallMessageHandler, QTimer,
+)
+
 
 def qt_message_handler(msg_type, context, message):
     if "QQuickImage" in message:
         return
     sys.stderr.write(f"{message}\n")
 
+
 qInstallMessageHandler(qt_message_handler)
+
+try:
+    import requests
+except ImportError:
+    raise SystemExit("❌ Модуль requests не установлен: pip install requests")
 
 try:
     import mpv
@@ -79,20 +79,22 @@ except ImportError as e:
     print(f"❌ MPV import: {e}")
 
 try:
+    import locale
     locale.setlocale(locale.LC_NUMERIC, 'C')
-except:
+except Exception:
     pass
 
-# Create a global session for Keep-Alive and connection reuse
+# Глобальная HTTP-сессия (keep-alive + переиспользование соединений)
 http_session = requests.Session()
 
 
-# ==============================================
-# ОПТИМИЗИРОВАННЫЙ HLS ПРОКСИ - РАБОТАЕТ ВСЕГДА
-# ==============================================
+# ============================================================
+#  КОНФИГУРАЦИЯ — ЕДИНЫЙ ИСТОЧНИК ПРАВДЫ
+# ============================================================
 
 BROWSER_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                  '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Accept': '*/*',
     'Accept-Language': 'en-US,en;q=0.9,ru;q=0.8',
     'Accept-Encoding': 'gzip, deflate, br',
@@ -102,160 +104,273 @@ BROWSER_HEADERS = {
     'Sec-Fetch-Site': 'same-site',
 }
 
+
+class CacheConfig:
+    """
+    Строгие лимиты кэша — единый источник правды (ТЗ: 200 МБ / 60 секунд).
+    ВАЖНО: это ПОТОЛОК буфера, он НЕ урезает качество. Пользователь сам
+    выбирает разрешение через setQuality; эти значения лишь не дают плееру
+    бесконечно разрастаться в оперативной памяти.
+    """
+    MAX_BYTES = "200MiB"          # максимум 200 МБ вперёд (ТЗ)
+    MAX_BACK_BYTES = "10MiB"      # назад только 10 МБ (перемотка)
+    CACHE_SECS = "60"             # максимум 60 секунд видео вперёд
+    READAHEAD_SECS = "60"         # readahead 60 с
+    HYSTERESIS_SECS = "10"        # стоп докачки, пока в кэше есть >=10 с
+    NETWORK_TIMEOUT = "20"        # таймаут сети
+
+
+# Профили качества: потолок буфера ПОД ПРОФИЛЬ.
+# demuxer-max-bytes НЕ может превышать CacheConfig.MAX_BYTES ("200МБ").
+QUALITY_PROFILES = {
+    "ultra":   {"readahead": "10", "max_bytes": "200MiB", "hls_bitrate": "max"},
+    "high":    {"readahead": "15", "max_bytes": "200MiB", "hls_bitrate": "8000000"},
+    "medium":  {"readahead": "30", "max_bytes": "150MiB", "hls_bitrate": "3000000"},
+    "low":     {"readahead": "60", "max_bytes": "100MiB", "hls_bitrate": "1200000"},
+    "minimal": {"readahead": "60", "max_bytes": "50MiB",  "hls_bitrate": "min"},
+    "auto":    {"readahead": CacheConfig.READAHEAD_SECS,
+                "max_bytes": "150MiB", "hls_bitrate": "no"},
+}
+
+# Карта целевых высот для программного масштабирования
+QUALITY_HEIGHTS = {"ultra": 2160, "high": 1080, "medium": 720, "low": 480, "minimal": 360}
+
+# Домены, требующие проксирования вложенных ресурсов (длинные токены → 414)
+PROXY_DOMAINS = ['televizor-24', 'streaming.', 'online-television']
+
+
+# ============================================================
+#  ПОТОКОБЕЗОПАСНАЯ БАЗА ДАННЫХ
+# ============================================================
+
+class Database:
+    """
+    Потокобезопасная обёртка над ОДНИМ соединением sqlite3.
+    Паттерн «serialized access to a single connection»: один reentrant-блокировщик
+    на все операции. Это даёт два гарантированных свойства, которых раньше не было:
+      1. Невозможен «database is locked» — соединение в любой момент трогает
+         максимум один поток (RLock сериализует доступ).
+      2. Данные не теряются и не разрушаются при параллельной записи из фоновых
+         потоков (recordChannelClick, predictNextChannel, prefetch).
+    RLock (а не Lock) — ради безопасных вложенных вызовов внутри одного потока.
+    """
+
+    def __init__(self, path="premium.db"):
+        self._lock = threading.RLock()
+        self._conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
+        self._conn.row_factory = sqlite3.Row
+        with self._lock:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA busy_timeout=30000")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+
+    def execute(self, sql, params=()):
+        with self._lock:
+            return self._conn.execute(sql, params)
+
+    def executemany(self, sql, params_seq):
+        with self._lock:
+            return self._conn.executemany(sql, params_seq)
+
+    def fetchall(self, sql, params=()):
+        with self._lock:
+            return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
+
+    def fetchone(self, sql, params=()):
+        with self._lock:
+            row = self._conn.execute(sql, params).fetchone()
+            return dict(row) if row else None
+
+    def commit(self):
+        with self._lock:
+            self._conn.commit()
+
+    def init_schema(self):
+        with self._lock:
+            c = self._conn
+            c.execute("""CREATE TABLE IF NOT EXISTS playlists (
+                id INTEGER PRIMARY KEY, name TEXT, proto TEXT, host TEXT, epg TEXT,
+                user TEXT, pwd TEXT, mac TEXT, channels TEXT, epg_db TEXT)""")
+            c.execute("""CREATE TABLE IF NOT EXISTS favorites (
+                playlist_id INTEGER, channel_id TEXT,
+                PRIMARY KEY (playlist_id, channel_id))""")
+            c.execute("""CREATE TABLE IF NOT EXISTS click_history (
+                id INTEGER PRIMARY KEY, ts INTEGER, channel_id TEXT,
+                channel_name TEXT, category TEXT, playlist_id INTEGER,
+                hour INTEGER, weekday INTEGER)""")
+            # Индексы под тяжёлые предсказательные запросы
+            c.execute("CREATE INDEX IF NOT EXISTS idx_history_cid ON click_history(channel_id)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_history_hour ON click_history(hour)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_history_wday ON click_history(weekday)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_history_ts ON click_history(ts)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_history_cat ON click_history(category)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_fav_pl ON favorites(playlist_id)")
+            c.commit()
+
+
+# ============================================================
+#  ОПТИМИЗАТОР ПОТОКА
+# ============================================================
+
 class StreamOptimizer:
     """
-    Оптимизатор потока для работы в любых условиях.
-    Автоматически адаптируется к качеству связи.
+    По умолчанию НЕ урезает качество — уважает выбор пользователя
+    (4K остаётся 4K, 1080p остаётся 1080p).
+    Жёсткую экономию трафика можно включить вручную из меню 💰 на OSD.
     """
-    
+
     def __init__(self):
-        self.quality_level = "auto"  # auto, low, medium, high, ultra
+        self.quality_level = "auto"
         self.bandwidth = 0.0
         self.reconnect_count = 0
         self.max_reconnects = 5
-        
+        # === РЕЖИМ ЭКОНОМИИ ТРАФИКА (по умолчанию ВЫКЛЮЧЕН) ===
+        self.force_lowest_variant = False
+        # Тест пропускной способности сам по себе жрёт ~512 KiB впустую → по умолчанию выкл.
+        self.bandwidth_probe_kib = 0
+
     def detect_bandwidth(self, url, proxy_url=None):
-        """Определяет пропускную способность канала"""
+        if self.bandwidth_probe_kib <= 0:
+            return 0.0
         try:
             proxies = {'http': proxy_url, 'https': proxy_url} if proxy_url else None
             start = time.time()
             r = http_session.get(url, headers=BROWSER_HEADERS, proxies=proxies, timeout=10, stream=True)
             data = b''
+            limit_bytes = self.bandwidth_probe_kib * 1024
             for chunk in r.iter_content(chunk_size=8192):
                 if chunk:
                     data += chunk
-                    if len(data) > 512 * 1024:  # 512KB достаточно
+                    if len(data) > limit_bytes:
                         break
             duration = time.time() - start
             if duration > 0:
-                self.bandwidth = (len(data) / 1024) / duration  # KB/s
+                self.bandwidth = (len(data) / 1024) / duration
                 print(f"[Optimizer] Bandwidth: {self.bandwidth:.1f} KB/s ({self.bandwidth * 8:.0f} Kbps)")
                 return self.bandwidth
         except Exception as e:
             print(f"[Optimizer] Bandwidth test failed: {e}")
         return 0.0
-    
+
     def get_quality_for_bandwidth(self, bandwidth):
-        """Выбирает качество в зависимости от пропускной способности"""
         kbps = bandwidth * 8
         if kbps > 20000:
-            return "ultra"  # 4K max
+            return "ultra"
         elif kbps > 8000:
-            return "high"   # 1080p
+            return "high"
         elif kbps > 3000:
-            return "medium" # 720p
+            return "medium"
         elif kbps > 1000:
-            return "low"    # 480p
+            return "low"
         else:
-            return "minimal"  # 360p
-    
+            return "minimal"
+
     def should_reconnect(self):
-        """Решает нужно ли переподключение"""
         return self.reconnect_count < self.max_reconnects
-    
+
     def increase_reconnect(self):
         self.reconnect_count += 1
-    
+
     def reset_reconnect(self):
         self.reconnect_count = 0
 
 
-# Глобальный оптимизатор
 stream_optimizer = StreamOptimizer()
 
 
+# ============================================================
+#  HLS КЭШ + ПРОКСИ
+# ============================================================
+
 class HLSCache:
-    """Умный кэш для m3u8 манифестов с оптимизацией"""
-    
-    # Class-level cache dictionary so it is shared across all HLSCache instances!
+    """Умный кэш m3u8: мастер-плейлисты 60 с, медиа-плейлисты 3.5 с."""
+
     _global_cache = {}
-    
+    _MAX_ENTRIES = 256
+
     def __init__(self, proxy_url=None, quality="auto"):
         self.proxy_url = proxy_url
         self.quality = quality
-        
+
+    @classmethod
+    def _evict_if_needed(cls):
+        # Лёгкая защита от бесконечного роста: при превышении лимита удаляем
+        # самые старые записи. TTL всё равно добьёт оставшиеся при чтении.
+        if len(cls._global_cache) > cls._MAX_ENTRIES:
+            sorted_items = sorted(cls._global_cache.items(), key=lambda kv: kv[1][1])
+            for k, _ in sorted_items[: cls._MAX_ENTRIES // 4]:
+                cls._global_cache.pop(k, None)
+
+    @classmethod
+    def clear(cls):
+        cls._global_cache.clear()
+
     def _get_quality_variant(self, content, bandwidth):
-        """Выбирает лучшую вариацию потока для пропускной способности и выбранного качества"""
+        """Выбирает вариант потока под выбранное качество / пропускную способность."""
         lines = content.split('\n')
         variants = []
-        
-        # Ищем #EXT-X-STREAM-INF
+
         for i, line in enumerate(lines):
             if '#EXT-X-STREAM-INF' in line:
-                bandwidth_match = re.search(r'BANDWIDTH=(\d+)', line)
-                resolution_match = re.search(r'RESOLUTION=(\d+x\d+)', line)
-                
-                if bandwidth_match:
-                    bw = int(bandwidth_match.group(1))
-                    res = resolution_match.group(1) if resolution_match else "unknown"
-                    bw_kbps = bw / 1000
-                    
-                    # Находим следующую непустую строку, которая является URI
+                bw_match = re.search(r'BANDWIDTH=(\d+)', line)
+                res_match = re.search(r'RESOLUTION=(\d+x\d+)', line)
+                if bw_match:
+                    bw = int(bw_match.group(1))
+                    res = res_match.group(1) if res_match else "unknown"
                     uri = ""
                     for j in range(i + 1, len(lines)):
-                        if lines[j].strip() and not lines[j].strip().startswith('#'):
-                            uri = lines[j].strip()
+                        cand = lines[j].strip()
+                        if cand and not cand.startswith('#'):
+                            uri = cand
                             break
-                    
                     if uri:
-                        variants.append({
-                            'bw': bw,
-                            'bw_kbps': bw_kbps,
-                            'resolution': res,
-                            'line_index': i,
-                            'uri': uri
-                        })
-        
+                        variants.append({'bw': bw, 'bw_kbps': bw / 1000,
+                                         'resolution': res, 'line_index': i, 'uri': uri})
+
         if not variants:
             return content
-        
-        # Сортируем по битрейту по возрастанию
+
         variants.sort(key=lambda x: x['bw_kbps'])
-        
-        # Определяем целевой битрейт
-        quality_level = stream_optimizer.quality_level
-        if quality_level == "auto":
-            # 15% запас под пропускную способность
-            target_bw_kbps = bandwidth * 8 * 0.85 if bandwidth > 0 else 3000
-        else:
-            mapping = {
-                "ultra": 50000,
-                "high": 8000,
-                "medium": 3000,
-                "low": 1200,
-                "minimal": 600
-            }
-            target_bw_kbps = mapping.get(quality_level, 3000)
-            
-        chosen = None
-        for v in variants:
-            if v['bw_kbps'] <= target_bw_kbps:
-                chosen = v
-            else:
-                break
-                
-        if not chosen:
-            # Если все варианты выше целевого, берем самый низкий
+
+        # === ЖЁСТКАЯ ЭКОНОМИЯ: всегда самый дешёвый вариант ===
+        if stream_optimizer.force_lowest_variant:
             chosen = variants[0]
-            
-        print(f"[Optimizer] Selected variant: {chosen['resolution']} ({chosen['bw_kbps']:.0f} Kbps) for target: {target_bw_kbps:.0f} Kbps (level: {quality_level})")
-        
-        # Перезаписываем m3u8 только с выбранным вариантом
+            print(f"[Optimizer] 💰 TRAFFIC SAVER: forced LOWEST variant "
+                  f"{chosen['resolution']} ({chosen['bw_kbps']:.0f} Kbps)")
+        else:
+            quality_level = stream_optimizer.quality_level
+            if quality_level == "auto":
+                target_bw_kbps = bandwidth * 8 * 0.85 if bandwidth > 0 else float('inf')
+            else:
+                target_bw_kbps = QUALITY_PROFILES.get(quality_level, {}).get('hls_bitrate', 'inf')
+                try:
+                    target_bw_kbps = float(target_bw_kbps)
+                except (TypeError, ValueError):
+                    target_bw_kbps = float('inf')  # 'max' → берём максимальный
+
+            chosen = None
+            for v in variants:
+                if v['bw_kbps'] <= target_bw_kbps:
+                    chosen = v
+                else:
+                    break
+            if not chosen:
+                chosen = variants[0]
+
+            print(f"[Optimizer] Selected variant: {chosen['resolution']} "
+                  f"({chosen['bw_kbps']:.0f} Kbps) for target {target_bw_kbps:.0f} Kbps (level: {quality_level})")
+
+        # Перезаписываем m3u8 только выбранным вариантом
         result_lines = []
         i = 0
         while i < len(lines):
             line = lines[i].rstrip()
             if '#EXT-X-STREAM-INF' in line:
-                is_chosen = False
-                for v in variants:
-                    if v['line_index'] == i and v == chosen:
-                        is_chosen = True
-                        break
-                
+                is_chosen = any(v['line_index'] == i and v is chosen for v in variants)
                 if is_chosen:
                     result_lines.append(line)
                 else:
-                    # Пропускаем этот stream-inf и его URI
+                    # Пропускаем stream-inf + его URI
                     i += 1
                     while i < len(lines) and (not lines[i].strip() or lines[i].strip().startswith('#')):
                         i += 1
@@ -264,21 +379,17 @@ class HLSCache:
             else:
                 result_lines.append(line)
             i += 1
-            
+
         return '\n'.join(result_lines)
-        
+
     def fetch_with_headers(self, url, referer=None):
-        """Загружает m3u8 с оптимизацией под пропускную способность"""
-        # Определяем, является ли плейлист мастер-плейлистом (содержит варианты качества)
-        # Мастер-плейлисты кэшируем на 60 секунд, а медиа-плейлисты (сегменты live) на 3.5 секунды
         if url in HLSCache._global_cache:
             cached_content, cached_time, cached_is_master = HLSCache._global_cache[url]
             ttl = 60 if cached_is_master else 3.5
             if time.time() - cached_time < ttl:
                 return cached_content, None
-        
+
         headers = BROWSER_HEADERS.copy()
-        
         if referer:
             headers['Referer'] = referer
             parsed = urllib.parse.urlparse(referer)
@@ -287,9 +398,9 @@ class HLSCache:
             parsed = urllib.parse.urlparse(url)
             headers['Referer'] = f"{parsed.scheme}://{parsed.netloc}/"
             headers['Origin'] = f"{parsed.scheme}://{parsed.netloc}"
-        
+
         proxies = {'http': self.proxy_url, 'https': self.proxy_url} if self.proxy_url else None
-        
+
         try:
             response = http_session.get(url, headers=headers, timeout=20, proxies=proxies)
             if response.status_code == 200:
@@ -297,67 +408,57 @@ class HLSCache:
                 try:
                     if response.headers.get('Content-Encoding') == 'gzip':
                         content = gzip.decompress(content)
-                except:
+                except Exception:
                     pass
-                
                 content = content.decode('utf-8', errors='ignore')
-                
                 is_master = '#EXT-X-STREAM-INF' in content
-                
-                # Оптимизируем под пропускную способность
+
                 if stream_optimizer.bandwidth > 0 or stream_optimizer.quality_level != "auto":
                     content = self._get_quality_variant(content, stream_optimizer.bandwidth)
-                
-                # Сохраняем в глобальный кэш
+
+                HLSCache._evict_if_needed()
                 HLSCache._global_cache[url] = (content, time.time(), is_master)
-                
                 return content, headers
         except Exception as e:
             print(f"❌ Cache fetch error: {e}")
-        
+
         return None, headers
 
 
 class HLSProxyHandler(BaseHTTPRequestHandler):
-    """Оптимизированный HLS Proxy с буферизацией и переподключением"""
-    
-    cache = None
+    """Оптимизированный HLS Proxy с буферизацией и переподключением."""
+
     proxy_url = None
     port = 8899
-    use_optimizer = True
     core_ref = None
     last_base_url = None
-    
+
     def log_message(self, format, *args):
         pass
-    
+
     def do_GET(self):
         try:
             if self.path.startswith('/hls/'):
-                encoded_url = self.path[5:]
-                original_url = urllib.parse.unquote(encoded_url)
+                original_url = urllib.parse.unquote(self.path[5:])
             elif self.path.startswith('/stream'):
-                parsed = urllib.parse.urlparse(self.path)
-                params = urllib.parse.parse_qs(parsed.query)
+                params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 original_url = params.get('url', [''])[0]
             else:
                 self.send_error(400)
                 return
-            
+
             if not original_url:
                 self.send_error(400)
                 return
-            
-            # Декодируем HTML сущности &amp; в URL (в цикле для глубокой очистки при double-encoding)
+
+            # Глубокая очистка double-encoded &amp;
             while '&amp;' in original_url:
                 original_url = original_url.replace('&amp;', '&')
-            
-            # Восстанавливаем относительный URL, если он пришел без http
+
             if not original_url.startswith('http'):
-                if hasattr(HLSProxyHandler, 'last_base_url') and HLSProxyHandler.last_base_url:
+                if HLSProxyHandler.last_base_url:
                     if original_url.startswith('/'):
-                        from urllib.parse import urlparse as up
-                        p = up(HLSProxyHandler.last_base_url)
+                        p = urllib.parse.urlparse(HLSProxyHandler.last_base_url)
                         original_url = f"{p.scheme}://{p.netloc}{original_url}"
                     else:
                         original_url = HLSProxyHandler.last_base_url + original_url
@@ -365,7 +466,7 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
                 else:
                     self.send_error(400)
                     return
-            
+
             lower = original_url.lower()
             if '.m3u8' in lower:
                 self._handle_m3u8(original_url)
@@ -373,111 +474,69 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
                 self._handle_segment(original_url)
             else:
                 self._handle_generic(original_url)
-                
+
         except Exception as e:
             print(f"❌ HLS Proxy error: {e}")
             try:
                 self.send_error(500)
-            except:
+            except Exception:
                 pass
-    
+
     def _handle_m3u8(self, url):
-        """Обрабатывает m3u8 с оптимизацией"""
-        # Сразу декодируем &amp; в URL, если они туда просочились
         while '&amp;' in url:
             url = url.replace('&amp;', '&')
-            
+
         print(f"📡 [HLS] Fetching: {url[:60]}...")
-        
-        # Тестируем пропускную способность
+
         if stream_optimizer.bandwidth == 0:
             stream_optimizer.detect_bandwidth(url, self.proxy_url)
-        
+
         cache = HLSCache(self.proxy_url, stream_optimizer.quality_level)
-        content, headers = cache.fetch_with_headers(url)
-        
+        content, _ = cache.fetch_with_headers(url)
+
         if not content:
-            print(f"❌ [HLS] Failed to fetch manifest")
+            print("❌ [HLS] Failed to fetch manifest")
             self.send_error(502)
             return
-        
-        print(f"✅ [HLS] Manifest loaded, quality optimized")
-        
-        # Базовая URL для относительных ссылок
+
+        print("✅ [HLS] Manifest loaded, quality optimized")
+
         base_url = url.rsplit('/', 1)[0] + '/'
-        
-        # Сохраняем базовый URL для возможного восстановления относительных путей в do_GET
         HLSProxyHandler.last_base_url = base_url
-        
-        # Определяем, нужно ли проксировать вложенные ресурсы этого домена.
-        # Например, jmp2.uk блокирует длинные проксированные запросы по 414 из-за гигантских токенов,
-        # поэтому их вложенные плейлисты и сегменты мы заставляем MPV запрашивать напрямую (через абсолютные ссылки)!
-        url_lower = url.lower()
-        proxy_sub_resources = any(domain in url_lower for domain in [
-            'televizor-24', 'streaming.', 'online-television'
-        ])
-        
+
+        proxy_sub = any(d in url.lower() for d in PROXY_DOMAINS)
+
         lines = []
         for line in content.split('\n'):
             line = line.rstrip()
-            
-            # Декодируем &amp; в строке манифеста
             while '&amp;' in line:
                 line = line.replace('&amp;', '&')
-            
+
             if not line:
                 lines.append(line)
                 continue
-                
+
             if line.startswith('#'):
-                # Если строка содержит URI (например, в тегах #EXT-X-MEDIA или #EXT-X-I-FRAME-STREAM-INF)
                 if 'URI=' in line:
                     match = re.search(r'URI="([^"]*)"', line)
                     if match:
                         uri_val = match.group(1)
                         while '&amp;' in uri_val:
                             uri_val = uri_val.replace('&amp;', '&')
-                            
-                        if not uri_val.startswith('http'):
-                            if uri_val.startswith('/'):
-                                from urllib.parse import urlparse as up
-                                p = up(url)
-                                absolute_uri = f"{p.scheme}://{p.netloc}{uri_val}"
-                            else:
-                                absolute_uri = base_url + uri_val
-                        else:
-                            absolute_uri = uri_val
-                        
-                        # Если требуется проксирование вложенных ресурсов
-                        if proxy_sub_resources:
-                            proxied_uri = f"http://127.0.0.1:{self.port}/hls/{urllib.parse.quote(absolute_uri, safe='')}"
-                        else:
-                            # Иначе даем прямой абсолютный URL
-                            proxied_uri = absolute_uri
-                            
-                        line = line.replace(f'URI="{match.group(1)}"', f'URI="{proxied_uri}"')
+                        uri_val = make_absolute(uri_val, base_url, url)
+                        proxied = (f"http://127.0.0.1:{self.port}/hls/"
+                                   f"{urllib.parse.quote(uri_val, safe='')}") if proxy_sub else uri_val
+                        line = line.replace(f'URI="{match.group(1)}"', f'URI="{proxied}"')
                 lines.append(line)
             else:
-                # Обычная строка ссылки (сегмент или суб-манифест)
-                if line.startswith('http'):
-                    absolute = line
-                elif line.startswith('/'):
-                    from urllib.parse import urlparse as up
-                    p = up(url)
-                    absolute = f"{p.scheme}://{p.netloc}{line}"
+                absolute = make_absolute(line, base_url, url)
+                if proxy_sub:
+                    lines.append(f"http://127.0.0.1:{self.port}/hls/{urllib.parse.quote(absolute, safe='')}")
                 else:
-                    absolute = base_url + line
-                
-                # Если требуется проксирование
-                if proxy_sub_resources:
-                    new_url = f"http://127.0.0.1:{self.port}/hls/{urllib.parse.quote(absolute, safe='')}"
-                else:
-                    new_url = absolute
-                    
-                lines.append(new_url)
-        
+                    lines.append(absolute)
+
         result = '\n'.join(lines)
-        
+
         self.send_response(200)
         self.send_header('Content-Type', 'application/vnd.apple.mpegurl')
         self.send_header('Content-Length', len(result))
@@ -486,25 +545,21 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Headers', '*')
         self.end_headers()
         self.wfile.write(result.encode('utf-8'))
-        
         print(f"✅ [HLS] Sent {len(lines)} lines")
-    
+
     def _handle_segment(self, url):
-        """Проксирует сегменты с буферизацией"""
-        max_retries = 3
-        retry_delay = 1
-        
+        max_retries, retry_delay = 3, 1
         for attempt in range(max_retries):
             try:
-                segment_headers = BROWSER_HEADERS.copy()
+                seg_headers = BROWSER_HEADERS.copy()
                 parsed = urllib.parse.urlparse(url)
-                segment_headers['Referer'] = f"{parsed.scheme}://{parsed.netloc}/"
-                segment_headers['Origin'] = f"{parsed.scheme}://{parsed.netloc}"
-                segment_headers['Accept-Encoding'] = 'identity'
-                
+                seg_headers['Referer'] = f"{parsed.scheme}://{parsed.netloc}/"
+                seg_headers['Origin'] = f"{parsed.scheme}://{parsed.netloc}"
+                seg_headers['Accept-Encoding'] = 'identity'
+
                 proxies = {'http': self.proxy_url, 'https': self.proxy_url} if self.proxy_url else None
-                response = http_session.get(url, headers=segment_headers, timeout=30, stream=True, proxies=proxies)
-                
+                response = http_session.get(url, headers=seg_headers, timeout=30, stream=True, proxies=proxies)
+
                 if response.status_code == 200:
                     self.send_response(200)
                     for key, value in response.headers.items():
@@ -513,68 +568,59 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
                     self.send_header('Connection', 'keep-alive')
                     self.send_header('Access-Control-Allow-Origin', '*')
                     self.end_headers()
-                    
-                    # Отправляем с буферизацией и замеряем скорость
+
                     start_time = time.time()
                     bytes_downloaded = 0
-                    buffer_size = 65536
-                    for chunk in response.iter_content(chunk_size=buffer_size):
+                    for chunk in response.iter_content(chunk_size=65536):
                         if chunk:
                             self.wfile.write(chunk)
                             bytes_downloaded += len(chunk)
-                            
+
                     duration = time.time() - start_time
                     if duration > 0.05 and bytes_downloaded > 1024:
                         speed_kb = (bytes_downloaded / 1024) / duration
-                        # Экспоненциальное сглаживание скорости
                         if stream_optimizer.bandwidth == 0:
                             stream_optimizer.bandwidth = speed_kb
                         else:
                             stream_optimizer.bandwidth = stream_optimizer.bandwidth * 0.7 + speed_kb * 0.3
-                            
-                        # Передаем скорость в IPTVCore для оценки сигнала
                         if HLSProxyHandler.core_ref:
                             try:
                                 HLSProxyHandler.core_ref.segmentDownloaded.emit(speed_kb)
-                            except:
+                            except Exception:
                                 pass
                     return
-                    
                 elif response.status_code in [403, 404]:
                     print(f"⚠️ [HLS] Segment {response.status_code}, retry {attempt + 1}/{max_retries}")
                     if attempt < max_retries - 1:
                         time.sleep(retry_delay)
                         continue
-                        
             except Exception as e:
                 print(f"⚠️ [HLS] Segment error: {e}, retry {attempt + 1}/{max_retries}")
                 if attempt < max_retries - 1:
                     time.sleep(retry_delay)
                     continue
-        
+
         try:
             self.send_error(500)
-        except:
+        except Exception:
             pass
-    
+
     def _handle_generic(self, url):
         try:
             proxies = {'http': self.proxy_url, 'https': self.proxy_url} if self.proxy_url else None
             response = http_session.get(url, headers=BROWSER_HEADERS, timeout=30, proxies=proxies)
-            
             self.send_response(response.status_code)
             for key, value in response.headers.items():
                 if key.lower() not in ['transfer-encoding', 'content-encoding']:
                     self.send_header(key, value)
             self.end_headers()
             self.wfile.write(response.content)
-            
-        except Exception as e:
+        except Exception:
             try:
                 self.send_error(500)
-            except:
+            except Exception:
                 pass
-    
+
     def do_OPTIONS(self):
         self.send_response(200)
         self.send_header('Access-Control-Allow-Origin', '*')
@@ -583,12 +629,25 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
 
+def make_absolute(candidate, base_url, full_url):
+    """Превращает относительный путь манифеста в абсолютный URL (один источник правды)."""
+    if candidate.startswith('http://') or candidate.startswith('https://'):
+        return candidate
+    while '&amp;' in candidate:
+        candidate = candidate.replace('&amp;', '&')
+    if candidate.startswith('/'):
+        p = urllib.parse.urlparse(full_url)
+        return f"{p.scheme}://{p.netloc}{candidate}"
+    return base_url + candidate
+
+
 class HLSProxyServer(ThreadingMixIn, HTTPServer):
     allow_reuse_address = True
     daemon_threads = True
 
 
 _hls_server = None
+
 
 def start_hls_proxy(proxy_url=None, port=8899, core=None):
     global _hls_server
@@ -601,13 +660,13 @@ def start_hls_proxy(proxy_url=None, port=8899, core=None):
         HLSProxyHandler.port = port
         HLSProxyHandler.core_ref = core
         _hls_server = HLSProxyServer(('127.0.0.1', port), HLSProxyHandler)
-        t = threading.Thread(target=_hls_server.serve_forever, daemon=True)
-        t.start()
+        threading.Thread(target=_hls_server.serve_forever, daemon=True).start()
         print(f"✅ [HLS Proxy] Started on port {port}")
         return f"http://127.0.0.1:{port}"
     except Exception as e:
         print(f"❌ [HLS Proxy] Start error: {e}")
         return None
+
 
 def stop_hls_proxy():
     global _hls_server
@@ -622,7 +681,7 @@ def get_proxied_url(url, port=8899):
     return f"http://127.0.0.1:{port}/hls/{urllib.parse.quote(url, safe='')}"
 
 
-# ✅ Проверенные рабочие URL без гео-блокировки!
+# Проверенные рабочие резервные потоки
 VERIFIED_WORKING_STREAMS = {
     "360": "https://cdn-evacoder-tv.facecast.io/evacoder_hls_hi/CkxfR1xNUAJwTgtXTBZTAJli/index.m3u8",
     "mma": "https://streams2.sofast.tv/vglive-sk-462904/playlist.m3u8",
@@ -630,52 +689,60 @@ VERIFIED_WORKING_STREAMS = {
     "drive": "https://stream8.cinerama.uz/1421/tracks-v1a1/mono.m3u8",
 }
 
+
 def get_fallback_url(channel_name):
-    """Возвращает резервный URL для канала"""
     for url in VERIFIED_WORKING_STREAMS.values():
         if url:
             return url
     return None
 
+
+# ============================================================
+#  ГЕО / СТРАНЫ
+# ============================================================
+
+COUNTRY_BY_KEYWORD = {
+    "france": ("FR", "Франция"), "french": ("FR", "Франция"),
+    "usa": ("US", "США"), "america": ("US", "США"),
+    "uk": ("GB", "Великобритания"), "bbc": ("GB", "Великобритания"),
+    "germany": ("DE", "Германия"), "deutsch": ("DE", "Германия"),
+    "italy": ("IT", "Италия"), "italian": ("IT", "Италия"),
+    "spain": ("ES", "Испания"), "spanish": ("ES", "Испания"),
+    "brazil": ("BR", "Бразилия"), "globo": ("BR", "Бразилия"),
+    "japan": ("JP", "Япония"), "japanese": ("JP", "Япония"),
+    "russia": ("RU", "Россия"), "россия": ("RU", "Россия"),
+    "матч": ("RU", "Россия"), "российский": ("RU", "Россия"),
+    "turkey": ("TR", "Турция"), "турция": ("TR", "Турция"),
+}
+
+RU_NAMES = {
+    "RU": "Россия", "US": "США", "GB": "Великобритания", "DE": "Германия",
+    "FR": "Франция", "IT": "Италия", "ES": "Испания", "TR": "Турция",
+    "UA": "Украина", "BY": "Беларусь", "KZ": "Казахстан", "NL": "Нидерланды",
+}
+
+
 def detect_country(cat, name):
     text = (str(cat) + " " + str(name)).lower()
-    country_map = {
-        "france": ("FR", "Франция"), "french": ("FR", "Франция"),
-        "usa": ("US", "США"), "america": ("US", "США"),
-        "uk": ("GB", "Великобритания"), "bbc": ("GB", "Великобритания"),
-        "germany": ("DE", "Германия"), "deutsch": ("DE", "Германия"),
-        "italy": ("IT", "Италия"), "italian": ("IT", "Италия"),
-        "spain": ("ES", "Испания"), "spanish": ("ES", "Испания"),
-        "brazil": ("BR", "Бразилия"), "globo": ("BR", "Бразилия"),
-        "japan": ("JP", "Япония"), "japanese": ("JP", "Япония"),
-        "russia": ("RU", "Россия"), "россия": ("RU", "Россия"),
-        "матч": ("RU", "Россия"), "российский": ("RU", "Россия"),
-        "turkey": ("TR", "Турция"), "турция": ("TR", "Турция"),
-    }
-    for kw, (code, cn) in country_map.items():
+    for kw, (code, cn) in COUNTRY_BY_KEYWORD.items():
         if kw in text:
             return code, cn
     return "ALL", "Глобальный"
+
 
 def get_ip_country(ip):
     try:
         r = requests.get(f"https://ipapi.co/{ip}/json/", timeout=5).json()
         code = r.get("country_code", "ALL")
         name = r.get("country_name", "Глобальный")
-        # Переводы на русский
-        ru_names = {
-            "RU": "Россия", "US": "США", "GB": "Великобритания", "DE": "Германия",
-            "FR": "Франция", "IT": "Италия", "ES": "Испания", "TR": "Турция",
-            "UA": "Украина", "BY": "Беларусь", "KZ": "Казахстан", "NL": "Нидерланды"
-        }
-        return code, ru_names.get(code, name)
-    except:
+        return code, RU_NAMES.get(code, name)
+    except Exception:
         return "ALL", "Глобальный"
 
 
-# ==============================================
-# IPTV WORKER & PARSER
-# ==============================================
+# ============================================================
+#  IPTV WORKER (ПАРСЕРЫ)
+# ============================================================
 
 class IPTVWorker(QThread):
     finished = Signal(list, dict, str)
@@ -695,22 +762,17 @@ class IPTVWorker(QThread):
             ch, epg_db = [], {}
             headers = BROWSER_HEADERS.copy()
 
-            # Нормализуем имя протокола: QML и БД хранят короткие значения
-            # "M3U" / "XTREAM" / "STALKER", а старые ветки могли писать
-            # "M3U (URL)" / "M3U (Файл)" / "Xtream" / "Stalker".
-            # Поддерживаем обе формы, чтобы и старые записи не сломались.
             proto_l = (self.proto or "").lower().strip()
+            host_l = (self.host or "").lower().strip()
 
-            if proto_l == "m3u" or proto_l.startswith("m3u"):
-                # В QML M3U объединён в одну вкладку — отличаем URL от файла по схеме
-                host_l = (self.host or "").lower().strip()
+            if proto_l.startswith("m3u"):
                 if host_l.startswith("http://") or host_l.startswith("https://"):
                     ch = self._parse_m3u(self.host, headers)
                 else:
                     ch = self._parse_m3u_file(self.host)
-            elif proto_l == "xtream" or proto_l.startswith("xtream"):
+            elif proto_l.startswith("xtream"):
                 ch = self._parse_xtream(headers)
-            elif proto_l == "stalker" or proto_l.startswith("stalker"):
+            elif proto_l.startswith("stalker"):
                 ch = self._parse_stalker(headers)
             else:
                 raise ValueError(f"Неизвестный протокол: '{self.proto}'")
@@ -720,10 +782,9 @@ class IPTVWorker(QThread):
 
             self.finished.emit(ch, epg_db, "Успешно загружено")
         except Exception as e:
-            # Прокидываем тип исключения вместе с текстом — так в диалоге
-            # сразу понятно, сетевая это ошибка, парсинг или БД.
             self.error.emit(f"{type(e).__name__}: {e}")
 
+    # --- M3U ---
     def _parse_m3u(self, url, h):
         r = requests.get(url, headers=h, timeout=20)
         return self._parse_m3u_text(r.text)
@@ -738,7 +799,6 @@ class IPTVWorker(QThread):
         for line in text.split('\n'):
             line = line.strip()
             if line.startswith('#EXTINF:'):
-                current = {}
                 name_match = re.search(r',([^,]*)$', line)
                 name = name_match.group(1).strip() if name_match else "Канал без названия"
                 attrs = {}
@@ -748,8 +808,7 @@ class IPTVWorker(QThread):
                     "id": attrs.get("tvg-id") or attrs.get("tvg-name") or name,
                     "logo": attrs.get("tvg-logo") or "",
                     "group": attrs.get("group-title") or "Общие",
-                    "name": name,
-                    "url": ""
+                    "name": name, "url": ""
                 }
             elif line.startswith('http') and current:
                 current["url"] = line
@@ -757,17 +816,22 @@ class IPTVWorker(QThread):
                 current = {}
         return ch
 
+    # --- Xtream ---
     def _parse_xtream(self, h):
         base = self.host.rstrip('/')
         cats = {}
         try:
-            cat_res = requests.get(f"{base}/player_api.php?username={self.user}&password={self.pwd}&action=get_live_categories", headers=h, timeout=15).json()
+            cat_res = requests.get(
+                f"{base}/player_api.php?username={self.user}&password={self.pwd}&action=get_live_categories",
+                headers=h, timeout=15).json()
             for c in cat_res:
                 cats[str(c.get('category_id'))] = c.get('category_name')
         except Exception as e:
             print(f"⚠️ Xtream cats: {e}")
 
-        res = requests.get(f"{base}/player_api.php?username={self.user}&password={self.pwd}&action=get_live_streams", headers=h, timeout=25).json()
+        res = requests.get(
+            f"{base}/player_api.php?username={self.user}&password={self.pwd}&action=get_live_streams",
+            headers=h, timeout=25).json()
         ch = []
         for i in res:
             cid = str(i.get('category_id', ''))
@@ -780,14 +844,19 @@ class IPTVWorker(QThread):
             })
         return ch
 
+    # --- Stalker ---
     def _parse_stalker(self, h):
         base = self.host.rstrip('/')
         h["X-User-MAC"], h["Cookie"] = self.mac, f"mac={self.mac}"
         hs = requests.get(f"{base}/server/load.php?type=stb&action=handshake", headers=h, timeout=15).json()
         tk = hs['js']['token']
-        res = requests.get(f"{base}/server/load.php?type=itv&action=get_all_channels&token={tk}", headers=h, timeout=20).json()
-        return [{"id": str(c.get('tvg_id', c.get('name'))), "name": c['name'], "logo": "", "group": "Stalker", "url": c['url'].split(' ')[-1]} for c in res.get('js', [])]
+        res = requests.get(
+            f"{base}/server/load.php?type=itv&action=get_all_channels&token={tk}",
+            headers=h, timeout=20).json()
+        return [{"id": str(c.get('tvg_id', c.get('name'))), "name": c['name'], "logo": "",
+                 "group": "Stalker", "url": c['url'].split(' ')[-1]} for c in res.get('js', [])]
 
+    # --- EPG ---
     def _load_epg(self, url, h):
         epg_db = {}
         try:
@@ -795,48 +864,27 @@ class IPTVWorker(QThread):
             content = r.content
             if url.endswith('.gz') or content[:2] == b'\x1f\x8b':
                 content = gzip.decompress(content)
-            
-            root = ElementTree.fromstring(content)
-            
-            # Парсим каналы
-            chan_map = {}
-            for chan in root.findall('channel'):
-                cid = chan.get('id')
-                dn = chan.find('display-name')
-                if cid and dn is not None:
-                    chan_map[cid] = dn.text
 
-            # Парсим программы
+            root = ElementTree.fromstring(content)
+
             for prog in root.findall('programme'):
                 channel_id = prog.get('channel')
                 title_node = prog.find('title')
                 desc_node = prog.find('desc')
-                
                 if channel_id and title_node is not None:
                     start_time = prog.get('start', '').split(' ')[0]
-                    # Конвертируем время в красивый вид HH:MM
                     try:
                         t = start_time[8:10] + ":" + start_time[10:12]
-                    except:
+                    except Exception:
                         t = "00:00"
-                        
                     title = title_node.text
                     desc = desc_node.text if desc_node is not None else ""
-                    
-                    if channel_id not in epg_db:
-                        epg_db[channel_id] = []
-                        
-                    epg_db[channel_id].append({
-                        "title": title,
-                        "time": t,
-                        "desc": desc,
-                        "start": start_time
+                    epg_db.setdefault(channel_id, []).append({
+                        "title": title, "time": t, "desc": desc, "start": start_time
                     })
-            
-            # Сортируем программы по времени
+
             for cid in epg_db:
                 epg_db[cid].sort(key=lambda x: x.get('start', ''))
-                
         except Exception as e:
             print(f"⚠️ EPG load error: {e}")
         return epg_db
@@ -846,36 +894,29 @@ class EPGModel(QAbstractListModel):
     def __init__(self):
         super().__init__()
         self._i = []
-        
+
     def rowCount(self, p=None):
         return len(self._i)
-        
+
     def data(self, index, role):
         if not index.isValid():
             return None
         v = self._i[index.row()]
-        if role == 201:
-            return v.get("title")
-        if role == 202:
-            return v.get("time")
-        if role == 203:
-            return v.get("desc")
-        if role == 204:
-            return v.get("start")
-        return None
-        
+        return {201: v.get("title"), 202: v.get("time"),
+                203: v.get("desc"), 204: v.get("start")}.get(role)
+
     def roleNames(self):
         return {201: b"displayTitle", 202: b"displayTime", 203: b"desc", 204: b"startRaw"}
-        
+
     def set_data(self, d):
         self.beginResetModel()
         self._i = d
         self.endResetModel()
 
 
-# ==============================================
-# IPTV CORE - ОПТИМИЗИРОВАННЫЙ ДЛЯ ЛЮБЫХ УСЛОВИЙ
-# ==============================================
+# ============================================================
+#  IPTV CORE
+# ============================================================
 
 class IPTVCore(QObject):
     statusChanged = Signal()
@@ -894,6 +935,7 @@ class IPTVCore(QObject):
     bufferingProgressChanged = Signal()
     segmentDownloaded = Signal(float)
     availableQualitiesChanged = Signal()
+    bandwidthSaverChanged = Signal()
 
     def __init__(self, engine):
         super().__init__()
@@ -916,246 +958,240 @@ class IPTVCore(QObject):
         self._retry_count = 0
         self._is_buffering = False
         self._buffering_progress = 100
-        self._connection_quality = "unknown"  # unknown, poor, fair, good, excellent
+        self._connection_quality = "unknown"
         self._current_quality = "auto"
         self._available_qualities = ["auto", "ultra", "high", "medium", "low", "minimal"]
         self._qualities_analyzed = False
-        
-        # Подключаем сигнал загрузки сегментов для thread-safe обновления уровня сигнала
+
+        # === ФЛАГИ ЭКОНОМИИ ТРАФИКА (по умолчанию ВЫКЛЮЧЕНЫ) ===
+        self._disable_logos = False
+        self._skip_country_detect = False
+
+        # Потокобезопасная БД
+        self.db = Database("premium.db")
+        self.db.init_schema()
+
+        # thread-safe сигнал уровня соединения
         self.segmentDownloaded.connect(self.update_connection_quality_from_speed)
-        
+
         if HAS_MPV:
+            self._init_mpv()
+
+    # --------------------------------------------------------
+    #  MPV
+    # --------------------------------------------------------
+    def _init_mpv(self):
+        try:
+            self.player = mpv.MPV(
+                vo='gpu', hwdec='auto-safe', ytdl=False, osc=False,
+                input_default_bindings=False, input_vo_keyboard=True,
+
+                keep_open='yes', keep_open_pause='no', hr_seek='yes',
+                network_timeout=CacheConfig.NETWORK_TIMEOUT,
+
+                # === СТРОГИЙ ЛИМИТ КЭША (ТЗ: 200 МБ / 60 секунд) ===
+                # Единый источник правды — CacheConfig. Больше нигде не переопределяем
+                # «волшебными числами»: 200 МБ есть 200 МБ во всех профилях качества.
+                cache='yes',
+                cache_secs=CacheConfig.CACHE_SECS,
+                demuxer_max_bytes=CacheConfig.MAX_BYTES,        # 200 MiB (ТЗ)
+                demuxer_max_back_bytes=CacheConfig.MAX_BACK_BYTES,
+                demuxer_readahead_secs=CacheConfig.READAHEAD_SECS,
+                demuxer_hysteresis_secs=CacheConfig.HYSTERESIS_SECS,
+
+                # Устойчивость к сети / live
+                demuxer_lavf_o='reconnect=1,reconnect_streamed=1,reconnect_delay_max=3,bufsize=64KiB',
+                force_seekable='yes',
+                # hls-bitrate / audio / subs — НЕ задаём здесь: управляются через setQuality и меню.
+            )
+            self.player['user-agent'] = BROWSER_HEADERS['User-Agent']
+
+            self._install_mpv_observers()
+            self._init = True
+            print("✅ MPV initialized "
+                  f"(cache capped {CacheConfig.MAX_BYTES}/{CacheConfig.CACHE_SECS}s, "
+                  f"hysteresis={CacheConfig.HYSTERESIS_SECS}s)")
+        except Exception as e:
+            print(f"❌ MPV init: {e}")
+
+    def _install_mpv_observers(self):
+        p = self.player
+
+        @p.property_observer('time-pos')
+        def on_time(_n, v):
+            self.positionChanged.emit()
+            if v is not None and v > 0:
+                self.playingChanged.emit(True)
+                self._retry_count = 0
+                if not self._qualities_analyzed:
+                    self._qualities_analyzed = True
+                    QTimer.singleShot(0, self._update_available_qualities_from_tracks)
+
+        @p.property_observer('duration')
+        def on_dur(_n, v):
+            self.durationChanged.emit()
+
+        @p.property_observer('pause')
+        def on_pause(_n, v):
+            self.playbackStateChanged.emit()
+            self.playingChanged.emit(not (v if v is not None else True))
+
+        @p.property_observer('volume')
+        def on_vol(_n, v):
+            self.volumeChanged.emit()
+
+        @p.property_observer('avsync')
+        def on_avsync(_n, v):
+            if v is not None and abs(v) > 1.0:
+                print(f"⚠️ AV desync detected: {v}")
+
+        try:
+            @p.property_observer('paused-for-cache')
+            def on_paused_for_cache(_n, v):
+                self._is_buffering = bool(v) if v is not None else False
+                self.bufferingChanged.emit()
+                if self._is_buffering:
+                    self._set_status("Буферизация...")
+                    self._set_connection_quality("poor")
+                else:
+                    self._retry_count = 0
+                    self._set_status("Воспроизведение...")
+        except Exception as e:
+            print(f"⚠️ Failed to observe paused-for-cache: {e}")
+
+        try:
+            @p.property_observer('cache-buffering-state')
+            def on_cache_buffering_state(_n, v):
+                self._buffering_progress = int(v) if v is not None else 100
+                self.bufferingProgressChanged.emit()
+        except Exception as e:
+            print(f"⚠️ Failed to observe cache-buffering-state: {e}")
+
+        try:
+            @p.property_observer('video-params')
+            def on_video_params(_n, v):
+                if v:
+                    QTimer.singleShot(0, self._update_available_qualities_from_tracks)
+        except Exception as e:
+            print(f"⚠️ Failed to observe video-params: {e}")
+
+        @p.event_callback('end-file')
+        def on_end(event):
             try:
-                self.player = mpv.MPV(
-                    vo='gpu',
-                    hwdec='no',
-                    ytdl=False,
-                    osc=False,
-                    input_default_bindings=False,
-                    input_vo_keyboard=True,
-                    # БАЗОВЫЕ ОПТИМИЗАЦИИ ДЛЯ БУНКЕРА
-                    keep_open='yes',
-                    keep_open_pause='no',
-                    hr_seek='yes',
-                    network_timeout='30',
-                    # ПРОФИЛЬ УМНОЙ БУФЕРИЗАЦИИ (до 60 секунд)
-                    cache='yes',
-                    demuxer_max_bytes='200MiB',
-                    demuxer_max_back_bytes='100MiB',
-                    demuxer_readahead_secs='60',
-                    # УСТОЙЧИВОСТЬ К СЕТЕВЫМ ПРОБЛЕМАМ (переподключение на уровне демультиплексора)
-                    demuxer_lavf_o='reconnect=1,reconnect_streamed=1,reconnect_delay_max=5,fflags=+nobuffer+fastseek',
-                    # ДЛЯ LIVE СТРИМОВ
-                    force_seekable='yes',
-                )
-                
-                print("✅ MPV initialized (buffering: 60s, reconnect: yes)")
-                
-                self.player['user-agent'] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                
-                # Оптимизация под низкую пропускную способность
-                self.player['demuxer-max-bytes'] = '100MiB'  # Макс размер буфера
-                self.player['network-timeout'] = '30'  # Таймаут сети 30 сек
-                
-                # События
-                @self.player.property_observer('time-pos')
-                def on_time(_n, v):
-                    self.positionChanged.emit()
-                    if v is not None and v > 0:
-                        self.playingChanged.emit(True)
-                        self._retry_count = 0  # Сброс счетчика при воспроизведении
-                        if not getattr(self, '_qualities_analyzed', False):
-                            self._qualities_analyzed = True
-                            QTimer.singleShot(0, self._update_available_qualities_from_tracks)
-                
-                @self.player.property_observer('duration')
-                def on_dur(_n, v):
-                    self.durationChanged.emit()
-                
-                @self.player.property_observer('pause')
-                def on_pause(_n, v):
-                    self.playbackStateChanged.emit()
-                    self.playingChanged.emit(not (v if v is not None else True))
-                    
-                @self.player.property_observer('volume')
-                def on_vol(_n, v):
-                    self.volumeChanged.emit()
-                
-                @self.player.property_observer('avsync')
-                def on_avsync(_n, v):
-                    # Следим за синхронизацией A/V
-                    if v is not None and abs(v) > 1.0:
-                        print(f"⚠️ AV desync detected: {v}")
-
-                # Наблюдение за буферизацией (для индикатора в бункере)
-                try:
-                    @self.player.property_observer('paused-for-cache')
-                    def on_paused_for_cache(_n, v):
-                        self._is_buffering = bool(v) if v is not None else False
-                        self.bufferingChanged.emit()
-                        if self._is_buffering:
-                            self._s = "Буферизация..."
-                            self.statusChanged.emit()
-                            self._connection_quality = "poor"
-                            self.connectionQualityChanged.emit("poor")
-                        else:
-                            if self._retry_count > 0:
-                                self._retry_count = 0
-                            self._s = "Воспроизведение..."
-                            self.statusChanged.emit()
-                except Exception as e:
-                    print(f"⚠️ Failed to observe paused-for-cache: {e}")
-
-                try:
-                    @self.player.property_observer('cache-buffering-state')
-                    def on_cache_buffering_state(_n, v):
-                        self._buffering_progress = int(v) if v is not None else 100
-                        self.bufferingProgressChanged.emit()
-                except Exception as e:
-                    print(f"⚠️ Failed to observe cache-buffering-state: {e}")
-
-                # Наблюдение за параметрами видео для динамического построения меню качеств
-                try:
-                    @self.player.property_observer('video-params')
-                    def on_video_params(_n, v):
-                        if v:
-                            QTimer.singleShot(0, self._update_available_qualities_from_tracks)
-                except Exception as e:
-                    print(f"⚠️ Failed to observe video-params: {e}")
-
-                @self.player.event_callback('end-file')
-                def on_end(event):
-                    try:
-                        if event.data:
-                            reason = event.data.reason
-                            err = event.data.error
-                            print(f"🎬 end-file: reason={reason}, error={err}")
-                            
-                            if reason == 0:  # EOF
-                                self._handle_playback_end()
-                            elif reason == 4:  # Error/Abort
-                                self._handle_playback_error(err)
-                    except Exception as e:
-                        print(f"⚠️ end-file handler: {e}")
-                
-                @self.player.event_callback('log-message')
-                def on_log(event):
-                    if event.text:
-                        text = event.text.lower()
-                        if 'buffering' in text or 'underrun' in text:
-                            self._connection_quality = "poor"
-                            self.connectionQualityChanged.emit("poor")
-                            print("📶 Connection: POOR (buffering)")
-                        elif 'cache' in text and 'full' in text:
-                            self._connection_quality = "good"
-                            self.connectionQualityChanged.emit("good")
-
-                @self.player.event_callback('seek')
-                def on_seek(event):
-                    print("[Player] Seeking...")
-
-                self._init = True
-                print("✅ MPV initialized (optimized for poor connection)")
+                if event.data:
+                    reason = event.data.reason
+                    err = event.data.error
+                    print(f"🎬 end-file: reason={reason}, error={err}")
+                    if reason == 0:
+                        self._handle_playback_end()
+                    elif reason == 4:
+                        self._handle_playback_error(err)
             except Exception as e:
-                print(f"❌ MPV init: {e}")
-        
-        self._init_db()
+                print(f"⚠️ end-file handler: {e}")
 
-    def _init_db(self):
-        self.db = sqlite3.connect("premium.db", check_same_thread=False)
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute("""CREATE TABLE IF NOT EXISTS playlists (
-            id INTEGER PRIMARY KEY, name TEXT, proto TEXT, host TEXT, epg TEXT,
-            user TEXT, pwd TEXT, mac TEXT, channels TEXT, epg_db TEXT)""")
-        self.db.execute("""CREATE TABLE IF NOT EXISTS favorites (
-            playlist_id INTEGER, channel_id TEXT, PRIMARY KEY (playlist_id, channel_id))""")
-        self.db.commit()
+        @p.event_callback('log-message')
+        def on_log(event):
+            if event.text:
+                t = event.text.lower()
+                if 'buffering' in t or 'underrun' in t:
+                    self._set_connection_quality("poor")
+                    print("📶 Connection: POOR (buffering)")
+                elif 'cache' in t and 'full' in t:
+                    self._set_connection_quality("good")
 
+        @p.event_callback('seek')
+        def on_seek(event):
+            print("[Player] Seeking...")
+
+    # --------------------------------------------------------
+    #  ХЕЛПЕРЫ СОСТОЯНИЯ
+    # --------------------------------------------------------
+    def _set_status(self, msg):
+        self._s = msg
+        self.statusChanged.emit()
+
+    def _set_connection_quality(self, q):
+        if self._connection_quality != q:
+            self._connection_quality = q
+            self.connectionQualityChanged.emit(q)
+
+    # --------------------------------------------------------
+    #  ПЕРЕПОДКЛЮЧЕНИЕ
+    # --------------------------------------------------------
     def _schedule_reconnect(self):
         if self._retry_count < 5:
             self._retry_count += 1
-            delay = 2 ** self._retry_count  # Экспоненциальная задержка: 2, 4, 8, 16, 32 сек
+            delay = 2 ** self._retry_count  # 2, 4, 8, 16, 32 сек
             print(f"[Player] Reconnecting in {delay}s... (attempt {self._retry_count}/5)")
-            self._s = f"Переподключение (попытка {self._retry_count}/5 через {delay}с)..."
-            self.statusChanged.emit()
-            
-            self._connection_quality = "poor"
-            self.connectionQualityChanged.emit("poor")
-            
+            self._set_status(f"Переподключение (попытка {self._retry_count}/5 через {delay}с)...")
+            self._set_connection_quality("poor")
             QTimer.singleShot(delay * 1000, self._do_reconnect)
         else:
             print("❌ Reconnect failed: max attempts reached.")
-            self._s = "Ошибка: потеряно соединение"
-            self.statusChanged.emit()
+            self._set_status("Ошибка: потеряно соединение")
             self._retry_count = 0
+
+    def _needs_proxy(self, url):
+        ul = url.lower()
+        return any(d in ul for d in PROXY_DOMAINS) or 'iframe' in ul
+
+    def _play_url(self, url):
+        """Проигрывает URL через прямой доступ или прокси — единая точка запуска."""
+        if self._needs_proxy(url):
+            start_hls_proxy(None, core=self)
+            self.player.play(get_proxied_url(url))
+            print(f"📡 Using optimized proxy: {get_proxied_url(url)[:60]}...")
+        else:
+            print("🎬 Playing directly...")
+            self.player.play(url)
 
     def _do_reconnect(self):
         if not self._last_url:
             return
-        
         print(f"[Player] Reconnecting attempt {self._retry_count}/5...")
         try:
-            url_lower = self._last_url.lower()
-            needs_proxy = any(domain in url_lower for domain in [
-                'televizor-24', 'streaming.', 'online-television'
-            ])
-            
-            if needs_proxy:
-                start_hls_proxy(None, core=self)
-                proxied = get_proxied_url(self._last_url)
-                self.player.play(proxied)
-            else:
-                self.player.play(self._last_url)
-                
+            self._play_url(self._last_url)
             self._apply_stream_optimizations()
         except Exception as e:
             print(f"[Player] Reconnect error: {e}")
             self._schedule_reconnect()
 
     def _handle_playback_end(self):
-        """Обработка завершения воспроизведения (или разрыва в live)"""
         try:
-            # Для LIVE потоков EOF означает потерю соединения, запускаем автопереподключение
             is_live = (self.duration == 0.0)
             if is_live and self._last_url:
                 print("📺 Live stream EOF, treating as disconnect...")
                 self._schedule_reconnect()
             else:
                 self._retry_count = 0
-                self._s = "Конец воспроизведения"
-                self.statusChanged.emit()
+                self._set_status("Конец воспроизведения")
         except Exception as e:
             print(f"⚠️ handle_playback_end error: {e}")
 
     def _handle_playback_error(self, err):
-        """Обработка ошибки воспроизведения"""
         print(f"⚠️ Playback error: {err}")
         self._schedule_reconnect()
 
     def _test_connection_quality(self, url):
-        """Тестирует качество соединения"""
         try:
             start = time.time()
-            r = http_session.head(url, timeout=10, stream=True)
+            r = http_session.head(url, timeout=10, allow_redirects=True)
             duration = time.time() - start
-            
-            if r.status_code in [200, 301, 302]:
+            if r.status_code in (200, 301, 302):
                 if duration < 0.5:
-                    self._connection_quality = "excellent"
+                    q = "excellent"
                 elif duration < 1.5:
-                    self._connection_quality = "good"
+                    q = "good"
                 elif duration < 3:
-                    self._connection_quality = "fair"
+                    q = "fair"
                 else:
-                    self._connection_quality = "poor"
-                
-                self.connectionQualityChanged.emit(self._connection_quality)
-                print(f"📶 Connection quality: {self._connection_quality.upper()}")
-                return self._connection_quality
-        except:
-            self._connection_quality = "poor"
-            self.connectionQualityChanged.emit("poor")
-        
+                    q = "poor"
+                self._set_connection_quality(q)
+                print(f"📶 Connection quality: {q.upper()}")
+                return q
+        except Exception:
+            pass
+        self._set_connection_quality("poor")
         return "poor"
 
     @Slot(float)
@@ -1170,67 +1206,99 @@ class IPTVCore(QObject):
             quality = "fair"
         else:
             quality = "poor"
-            
-        if self._connection_quality != quality:
-            self._connection_quality = quality
-            self.connectionQualityChanged.emit(quality)
+        self._set_connection_quality(quality)
+        if quality != self._connection_quality:
             print(f"📶 [Connection] Speed updated: {speed_kb:.1f} KB/s -> {quality}")
 
+    # --------------------------------------------------------
+    #  QML PROPERTIES
+    # --------------------------------------------------------
     @Property(str, notify=statusChanged)
     def status(self): return self._s
 
     @Property(list, notify=playlistsChanged)
     def playlists(self):
-        cursor = self.db.execute("SELECT id, name, proto, host, epg, user, pwd, mac FROM playlists ORDER BY id DESC")
-        return [{"id": r[0], "name": r[1], "proto": r[2], "host": r[3], "epg": r[4], "user": r[5], "pwd": r[6], "mac": r[7]} for r in cursor.fetchall()]
+        return self.db.fetchall(
+            "SELECT id, name, proto, host, epg, user, pwd, mac FROM playlists ORDER BY id DESC")
 
     @Property(str, notify=channelsChanged)
     def current_playlist_name(self): return self._current_playlist_name
 
     @Property(list, notify=channelsChanged)
     def categories(self):
-        cats = set()
-        for c in self._ch:
-            cats.add(c.get("group", "Общие"))
-        return ["Все каналы", "★ Избранные"] + sorted(list(cats))
-    
+        cats = {c.get("group", "Общие") for c in self._ch}
+        return ["Все каналы", "★ Избранные"] + sorted(cats)
+
     @Property(str, notify=connectionQualityChanged)
     def connectionQuality(self): return self._connection_quality
-    
+
     @Property(str, notify=qualityChanged)
     def currentQuality(self): return self._current_quality
 
     @Property(list, notify=availableQualitiesChanged)
-    def availableQualities(self):
-        return self._available_qualities
+    def availableQualities(self): return self._available_qualities
 
     @Property(bool, notify=availableQualitiesChanged)
     def ultraAvailable(self): return "ultra" in self._available_qualities
-    
+
     @Property(bool, notify=availableQualitiesChanged)
     def highAvailable(self): return "high" in self._available_qualities
-    
+
     @Property(bool, notify=availableQualitiesChanged)
     def mediumAvailable(self): return "medium" in self._available_qualities
-    
+
     @Property(bool, notify=availableQualitiesChanged)
     def lowAvailable(self): return "low" in self._available_qualities
-    
+
     @Property(bool, notify=availableQualitiesChanged)
     def minimalAvailable(self): return "minimal" in self._available_qualities
 
+    # --- Флаги экономии трафика ---
+    @Property(bool, notify=bandwidthSaverChanged)
+    def disableLogos(self): return self._disable_logos
+
+    @disableLogos.setter
+    def disableLogos(self, val):
+        if self._disable_logos != bool(val):
+            self._disable_logos = bool(val)
+            self.bandwidthSaverChanged.emit()
+            print(f"[SAVER] Логотипы {'ВЫКЛЮЧЕНЫ' if self._disable_logos else 'ВКЛЮЧЕНЫ'}")
+
+    @Property(bool, notify=bandwidthSaverChanged)
+    def skipCountryDetect(self): return self._skip_country_detect
+
+    @skipCountryDetect.setter
+    def skipCountryDetect(self, val):
+        if self._skip_country_detect != bool(val):
+            self._skip_country_detect = bool(val)
+            self.bandwidthSaverChanged.emit()
+            print(f"[SAVER] Детект страны {'ВЫКЛЮЧЕН' if self._skip_country_detect else 'ВКЛЮЧЕН'}")
+
+    @Property(bool, notify=bandwidthSaverChanged)
+    def forceLowestVariant(self): return stream_optimizer.force_lowest_variant
+
+    @forceLowestVariant.setter
+    def forceLowestVariant(self, val):
+        new = bool(val)
+        if stream_optimizer.force_lowest_variant != new:
+            stream_optimizer.force_lowest_variant = new
+            HLSCache.clear()  # немедленное применение нового выбора варианта
+            self.bandwidthSaverChanged.emit()
+            print(f"[SAVER] Принудительный lowest ABR variant: {'ВКЛ' if new else 'ВЫКЛ'}")
+
+    # --- Playback ---
     @Property(bool, notify=bufferingChanged)
-    def isBuffering(self):
-        return self._is_buffering
-        
+    def isBuffering(self): return self._is_buffering
+
     @Property(int, notify=bufferingProgressChanged)
-    def bufferingProgress(self):
-        return getattr(self, '_buffering_progress', 100)
+    def bufferingProgress(self): return self._buffering_progress
 
     @Property(float, notify=positionChanged)
     def position(self):
-        if HAS_MPV and self.player and self._init and self.player.time_pos:
-            return float(self.player.time_pos)
+        if HAS_MPV and self.player and self._init:
+            v = self.player.time_pos
+            if v is not None:
+                return float(v)
         return 0.0
 
     @position.setter
@@ -1241,19 +1309,23 @@ class IPTVCore(QObject):
                 if self.player.pause:
                     self.player.pause = False
                 self.positionChanged.emit()
-            except:
+            except Exception:
                 pass
 
     @Property(float, notify=durationChanged)
     def duration(self):
-        if HAS_MPV and self.player and self._init and self.player.duration:
-            return float(self.player.duration)
+        if HAS_MPV and self.player and self._init:
+            v = self.player.duration
+            if v is not None:
+                return float(v)
         return 0.0
 
     @Property(int, notify=volumeChanged)
     def volume(self):
-        if HAS_MPV and self.player and self._init and self.player.volume:
-            return int(self.player.volume)
+        if HAS_MPV and self.player and self._init:
+            v = self.player.volume
+            if v is not None:           # фикс: громкость 0 больше не превращается в 80
+                return int(v)
         return 80
 
     @volume.setter
@@ -1262,7 +1334,7 @@ class IPTVCore(QObject):
             try:
                 self.player.volume = int(val)
                 self.volumeChanged.emit()
-            except:
+            except Exception:
                 pass
 
     @Property(bool, notify=playbackStateChanged)
@@ -1281,26 +1353,41 @@ class IPTVCore(QObject):
     def togglePause(self):
         if HAS_MPV and self.player and self._init:
             try:
-                if self.player.time_pos and self.player.duration and self.player.time_pos >= self.player.duration - 1:
+                if self.player.time_pos and self.player.duration \
+                        and self.player.time_pos >= self.player.duration - 1:
                     self.player.time_pos = 0.0
-            except:
+            except Exception:
                 pass
             self.player.pause = not self.player.pause
             self.playbackStateChanged.emit()
 
+    @Property(str, notify=statusChanged)
+    def targetCode(self): return self._target_code
+
+    @Property(str, notify=statusChanged)
+    def targetName(self): return self._target_name
+
+    @Property(QObject, constant=True)
+    def epgModel(self): return self._em
+
+    # --------------------------------------------------------
+    #  ПЛЕЙЛИСТЫ
+    # --------------------------------------------------------
     @Slot(int)
     def loadPlaylist(self, pid):
-        r = self.db.execute("SELECT name, proto, channels, epg_db FROM playlists WHERE id=?", (pid,)).fetchone()
+        r = self.db.fetchone(
+            "SELECT name, proto, channels, epg_db FROM playlists WHERE id=?", (pid,))
         if r:
             self.current_playlist_id = pid
-            self._current_playlist_name = r[0]
+            self._current_playlist_name = r["name"]
             try:
-                self._ch = json.loads(r[2])
-                self._ed = json.loads(r[3])
-            except:
-                self._ch, self._ed = [], []
-            favs = self.db.execute("SELECT channel_id FROM favorites WHERE playlist_id=?", (pid,)).fetchall()
-            self._fav_ids = set(f[0] for f in favs)
+                self._ch = json.loads(r["channels"])
+                self._ed = json.loads(r["epg_db"])
+            except Exception:
+                self._ch, self._ed = [], {}
+            favs = self.db.fetchall(
+                "SELECT channel_id FROM favorites WHERE playlist_id=?", (pid,))
+            self._fav_ids = {f["channel_id"] for f in favs}
             self.channelsChanged.emit()
 
     @Slot(str, str, result=list)
@@ -1325,11 +1412,15 @@ class IPTVCore(QObject):
         if not self.current_playlist_id:
             return False
         if cid in self._fav_ids:
-            self._fav_ids.remove(cid)
-            self.db.execute("DELETE FROM favorites WHERE playlist_id=? AND channel_id=?", (self.current_playlist_id, cid))
+            self._fav_ids.discard(cid)
+            self.db.execute(
+                "DELETE FROM favorites WHERE playlist_id=? AND channel_id=?",
+                (self.current_playlist_id, cid))
         else:
             self._fav_ids.add(cid)
-            self.db.execute("INSERT OR REPLACE INTO favorites (playlist_id, channel_id) VALUES (?, ?)", (self.current_playlist_id, cid))
+            self.db.execute(
+                "INSERT OR REPLACE INTO favorites (playlist_id, channel_id) VALUES (?, ?)",
+                (self.current_playlist_id, cid))
         self.db.commit()
         self.channelsChanged.emit()
         return cid in self._fav_ids
@@ -1341,38 +1432,35 @@ class IPTVCore(QObject):
     @Slot(str, str, str, str, str, str, str)
     def addPlaylist(self, name, proto, host, epg, user, pwd, mac):
         if not name.strip() or not host.strip():
-            self._s = "Ошибка: Имя и URL обязательны!"
-            self.statusChanged.emit()
+            self._set_status("Ошибка: Имя и URL обязательны!")
             return
-        self._s = "Подключение..."
-        self.statusChanged.emit()
+        self._set_status("Подключение...")
         self.w = IPTVWorker(proto, host, epg, user, pwd, mac)
-        self.w.finished.connect(lambda ch, epg_db, msg: self._on_loaded(name, proto, host, epg, user, pwd, mac, ch, epg_db))
+        self.w.finished.connect(
+            lambda ch, epg_db, msg: self._on_loaded(name, proto, host, epg, user, pwd, mac, ch, epg_db))
         self.w.error.connect(self._on_error)
         self.w.start()
 
     def _on_loaded(self, name, proto, host, epg, user, pwd, mac, ch, epg_db):
         if not ch:
-            self._s = "Ошибка: пустой плейлист!"
-            self.statusChanged.emit()
+            self._set_status("Ошибка: пустой плейлист!")
             self.loadFailed.emit("Плейлист пуст")
             return
         try:
-            self.db.execute("INSERT INTO playlists (name, proto, host, epg, user, pwd, mac, channels, epg_db) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            self.db.execute(
+                "INSERT INTO playlists (name, proto, host, epg, user, pwd, mac, channels, epg_db) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (name, proto, host, epg, user, pwd, mac, json.dumps(ch), json.dumps(epg_db)))
             self.db.commit()
-            self._s = "Добавлено!"
-            self.statusChanged.emit()
+            self._set_status("Добавлено!")
             self.playlistsChanged.emit()
             self.loadFinished.emit()
         except Exception as e:
-            self._s = f"Ошибка БД: {e}"
-            self.statusChanged.emit()
+            self._set_status(f"Ошибка БД: {e}")
             self.loadFailed.emit(str(e))
 
     def _on_error(self, msg):
-        self._s = f"Ошибка: {msg}"
-        self.statusChanged.emit()
+        self._set_status(f"Ошибка: {msg}")
         self.loadFailed.emit(msg)
 
     @Slot()
@@ -1381,10 +1469,9 @@ class IPTVCore(QObject):
             try:
                 self.w.finished.disconnect()
                 self.w.error.disconnect()
-            except:
+            except Exception:
                 pass
-            self._s = "Отменено"
-            self.statusChanged.emit()
+            self._set_status("Отменено")
 
     @Slot('QVariant')
     def deletePlaylist(self, pid):
@@ -1393,260 +1480,434 @@ class IPTVCore(QObject):
         try:
             if hasattr(pid, 'toVariant'):
                 pid = pid.toVariant()
-            self.db.execute("DELETE FROM playlists WHERE id=?", (int(pid),))
-            self.db.execute("DELETE FROM favorites WHERE playlist_id=?", (int(pid),))
+            pid = int(pid)
+            self.db.execute("DELETE FROM playlists WHERE id=?", (pid,))
+            self.db.execute("DELETE FROM favorites WHERE playlist_id=?", (pid,))
             self.db.commit()
             self.playlistsChanged.emit()
         except Exception as e:
             print(f"❌ Delete: {e}")
 
+    # --------------------------------------------------------
+    #  EPG
+    # --------------------------------------------------------
     @Slot(str)
     def updateEPG(self, cid):
         self._em.set_data(self._ed.get(cid, []))
 
     @Slot(str, result=str)
     def getCurrentEPG(self, cid):
-        now = datetime.now().strftime("%Y%m%d%H%M%S")
+        """
+        Возвращает ПЕРЕДАЧУ, ИДУЩУЮ СЕЙЧАС (а не первую в списке).
+        EPG отсортирован по start (YYYYMMDDHHMMSS). Бинарный поиск последней
+        передачи с start <= now. Если все в будущем — берём ближайшую.
+        """
         epg_list = self._ed.get(cid, [])
         if not epg_list:
             return "Нет программы"
-        for p in epg_list:
-            start = p.get("start", "")
-            if start and start <= now:
-                continue
-        return epg_list[0].get("title", "")
+
+        now = datetime.now().strftime("%Y%m%d%H%M%S")
+        import bisect
+        starts = [p.get("start", "") for p in epg_list]
+
+        # Индекс первого элемента строго после now
+        idx = bisect.bisect_right(starts, now)
+
+        if idx > 0:
+            # Текущая/последняя начавшаяся передача
+            return epg_list[idx - 1].get("title", "") or "Нет программы"
+        # Все передачи в будущем — показываем ближайшую
+        return epg_list[0].get("title", "") or "Нет программы"
 
     @Slot(str, str, result=str)
     def getArchiveUrl(self, url, start_raw):
-        f_url = url
-        if start_raw:
-            try:
-                ts = int(datetime.strptime(start_raw, "%Y%m%d%H%M%S").replace(timezone.utc).timestamp())
-                f_url = f"{url}?utc={ts}" if "?" not in url else f"{url}&utc={ts}"
-            except:
-                pass
-        return f_url
+        return _append_utc(url, start_raw)
 
+    # --------------------------------------------------------
+    #  ПРЕДЗАГРУЗКА КАНАЛОВ (мгновенный старт)
+    # --------------------------------------------------------
+    _prefetch_semaphore = None
+    _prefetched_recently = {}
+    _MAX_CONCURRENT_PREFETCH = 4
+    _MAX_PREFETCH_BATCH = 30
+    _PREFETCH_RETRIES = 3
+
+    @Slot('QVariant')
+    def prefetchChannel(self, ch):
+        if not ch or not isinstance(ch, dict):
+            return
+        url = ch.get('url', '')
+        if not url:
+            return
+        # защита от роста
+        if len(self._prefetched_recently) > 500:
+            cutoff = time.time() - 600
+            self._prefetched_recently = {k: v for k, v in self._prefetched_recently.items() if v > cutoff}
+        self._prefetched_recently[url] = time.time()
+        threading.Thread(target=self._do_prefetch, args=(ch,), daemon=True).start()
+
+    def _do_prefetch(self, ch):
+        if self._prefetch_semaphore is None:
+            self._prefetch_semaphore = threading.Semaphore(self._MAX_CONCURRENT_PREFETCH)
+        if not self._prefetch_semaphore.acquire(timeout=15):
+            return
+        try:
+            url = ch.get('url', '')
+            if not url:
+                return
+            cache = HLSCache(None, stream_optimizer.quality_level)
+            content, _ = cache.fetch_with_headers(url)
+            if not content:
+                return
+            # Ищем URI варианта или первый сегмент
+            try:
+                lines = content.split('\n')
+                variant_uri = None
+                for i, line in enumerate(lines):
+                    if '#EXT-X-STREAM-INF' in line:
+                        for j in range(i + 1, len(lines)):
+                            cand = lines[j].strip()
+                            if cand and not cand.startswith('#'):
+                                variant_uri = cand
+                                break
+                        if variant_uri:
+                            break
+                if not variant_uri:
+                    for line in lines:
+                        s = line.strip()
+                        if s and not s.startswith('#') and '.ts' in s.lower():
+                            variant_uri = s
+                            break
+                if variant_uri:
+                    abs_url = make_absolute(variant_uri, url.rsplit('/', 1)[0] + '/', url)
+                    for attempt in range(self._PREFETCH_RETRIES):
+                        try:
+                            http_session.get(abs_url, headers=BROWSER_HEADERS, timeout=10, stream=True)
+                            break
+                        except Exception:
+                            if attempt == self._PREFETCH_RETRIES - 1:
+                                raise
+            except Exception:
+                pass
+        except Exception:
+            pass
+        finally:
+            self._prefetch_semaphore.release()
+
+    @Slot()
+    def prefetchVisibleChannels(self):
+        if not self._ch:
+            return
+        for ch in self._ch[:self._MAX_PREFETCH_BATCH]:
+            self.prefetchChannel(ch)
+
+    @Slot('QVariant')
+    def recordChannelClick(self, ch):
+        try:
+            if not ch or not isinstance(ch, dict):
+                return
+            now = time.time()
+            ts_struct = time.localtime(now)
+            self.db.execute(
+                "INSERT INTO click_history (ts, channel_id, channel_name, category, playlist_id, hour, weekday) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (int(now), str(ch.get('id', '')), str(ch.get('name', '')),
+                 str(ch.get('group', '')),
+                 int(self.current_playlist_id) if self.current_playlist_id else 0,
+                 ts_struct.tm_hour, ts_struct.tm_wday))
+            self.db.commit()
+        except Exception as e:
+            print(f"[Predictor] record error: {e}")
+
+    @Slot('QVariant', result='QVariant')
+    def predictNextChannel(self, current_ch):
+        """Многоступенчатое предсказание + префетч топ-кандидатов.
+        Учитывает последовательность, время суток, день недели, категорию."""
+        try:
+            if not current_ch or not isinstance(current_ch, dict):
+                return None
+            cur_id = str(current_ch.get('id', ''))
+            cur_cat = str(current_ch.get('group', ''))
+            now_struct = time.localtime(time.time())
+            cur_hour, cur_wday = now_struct.tm_hour, now_struct.tm_wday
+
+            candidates = {}
+
+            def _add(cid, name, cat, score, source):
+                if not cid or cid == cur_id:
+                    return
+                if cid in candidates:
+                    old = candidates[cid]
+                    candidates[cid] = (old[0], old[1], old[2] + score, source + "+" + old[3])
+                else:
+                    candidates[cid] = (name, cat, score, source)
+
+            # 1. Последовательная (>=3 подтверждений)
+            for r in self.db.fetchall(
+                """SELECT ch2.channel_id AS cid, ch2.channel_name AS cname, ch2.category AS cat, COUNT(*) AS cnt
+                   FROM click_history ch1
+                   JOIN click_history ch2 ON ch2.ts > ch1.ts AND ch2.ts < ch1.ts + 120
+                                          AND ch2.channel_id != ch1.channel_id
+                   WHERE ch1.channel_id = ? AND ABS(ch1.hour - ?) <= 2
+                   GROUP BY ch2.channel_id ORDER BY cnt DESC LIMIT 5""",
+                (cur_id, cur_hour)):
+                if r["cnt"] >= 3:
+                    _add(r["cid"], r["cname"], r["cat"], r["cnt"] * 10, "seq")
+
+            # 2. Популярный в этот час (±1)
+            for r in self.db.fetchall(
+                """SELECT channel_id AS cid, channel_name AS cname, category AS cat, COUNT(*) AS cnt
+                   FROM click_history WHERE ABS(hour - ?) <= 1
+                   GROUP BY channel_id ORDER BY cnt DESC LIMIT 5""",
+                (cur_hour,)):
+                _add(r["cid"], r["cname"], r["cat"], r["cnt"] * 2, "hour")
+
+            # 3. Популярный в этот день недели
+            for r in self.db.fetchall(
+                """SELECT channel_id AS cid, channel_name AS cname, category AS cat, COUNT(*) AS cnt
+                   FROM click_history WHERE weekday = ?
+                   GROUP BY channel_id ORDER BY cnt DESC LIMIT 5""",
+                (cur_wday,)):
+                _add(r["cid"], r["cname"], r["cat"], r["cnt"], "weekday")
+
+            # 4. Из той же категории
+            if cur_cat:
+                for r in self.db.fetchall(
+                    """SELECT channel_id AS cid, channel_name AS cname, COUNT(*) AS cnt
+                       FROM click_history WHERE category = ?
+                       GROUP BY channel_id ORDER BY cnt DESC LIMIT 3""",
+                    (cur_cat,)):
+                    _add(r["cid"], r["cname"], cur_cat, r["cnt"] * 0.5, "cat")
+
+            if not candidates:
+                return None
+
+            sorted_cands = sorted(candidates.items(), key=lambda x: -x[1][2])
+            top5 = sorted_cands[:5]
+            for cid, _ in top5:
+                for ch in self._ch:
+                    if ch.get('id') == cid:
+                        self.prefetchChannel(ch)
+                        break
+
+            top_id, (top_name, top_cat, top_score, top_src) = top5[0]
+            return {'id': top_id, 'name': top_name, 'category': top_cat,
+                    'confidence': min(int(top_score), 100), 'source': top_src,
+                    'candidates_count': len(top5)}
+        except Exception as e:
+            print(f"[Predictor] predict error: {e}")
+        return None
+
+    # --------------------------------------------------------
+    #  КАЧЕСТВО
+    # --------------------------------------------------------
     @Slot(str, result=str)
     def setQuality(self, quality):
-        """
-        Устанавливает качество видео.
-        quality: "auto", "ultra", "high", "medium", "low", "minimal"
-        """
+        """Устанавливает качество. Профили кэша — из единого QUALITY_PROFILES.
+        ABR (hls-bitrate) переключает поток с восстановлением позиции для архивов;
+        масштабирование (vf scale) применяется НА ЛЕТУ без перезагрузки."""
         if self._current_quality == quality:
             return quality
-            
+
         self._current_quality = quality
         stream_optimizer.quality_level = quality
         self.qualityChanged.emit(quality)
         print(f"📺 Quality set to: {quality}")
-        
-        if self.player and self._init:
-            try:
-                # 1. Настройка параметров буферизации MPV под выбранный профиль
-                if quality == "ultra":
-                    self.player['demuxer-readahead-secs'] = '10'
-                    self.player['demuxer-max-bytes'] = '300MiB'
-                    try: self.player['hls-bitrate'] = 'max'
-                    except: pass
-                elif quality == "high":
-                    self.player['demuxer-readahead-secs'] = '15'
-                    self.player['demuxer-max-bytes'] = '200MiB'
-                    try: self.player['hls-bitrate'] = '8000000'
-                    except: pass
-                elif quality == "medium":
-                    self.player['demuxer-readahead-secs'] = '30'
-                    self.player['demuxer-max-bytes'] = '150MiB'
-                    try: self.player['hls-bitrate'] = '3000000'
-                    except: pass
-                elif quality == "low":
-                    self.player['demuxer-readahead-secs'] = '60'
-                    self.player['demuxer-max-bytes'] = '100MiB'
-                    try: self.player['hls-bitrate'] = '1200000'
-                    except: pass
-                elif quality == "minimal":
-                    self.player['demuxer-readahead-secs'] = '60'
-                    self.player['demuxer-max-bytes'] = '50MiB'
-                    try: self.player['hls-bitrate'] = 'min'
-                    except: pass
-                elif quality == "auto":
-                    self.player['demuxer-readahead-secs'] = '60'
-                    self.player['demuxer-max-bytes'] = '150MiB'
-                    try: self.player['hls-bitrate'] = 'no'
-                    except: pass
-                
-                self.player['cache'] = 'yes'
-                
-                # 2. Насильно масштабируем видео в реальном времени!
-                # Мы используем сверхбыстрые флаги масштабирования sws-flags='fast_bilinear' (билинейная интерполяция),
-                # чтобы программное масштабирование (даже до 4К) шло абсолютно плавно, мягко и без зависаний!
-                try:
-                    self.player['sws-flags'] = 'fast_bilinear'
-                except:
-                    pass
-                
-                height_map = {
-                    "ultra": 2160,
-                    "high": 1080,
-                    "medium": 720,
-                    "low": 480,
-                    "minimal": 360
-                }
-                
-                # Читаем исходную высоту видео из свойств MPV
-                original_height = None
-                try:
-                    v_params = getattr(self.player, 'video_params', None)
-                    if v_params and isinstance(v_params, dict):
-                        original_height = v_params.get('h')
-                    if not original_height:
-                        vo_params = getattr(self.player, 'video_out_params', None)
-                        if vo_params and isinstance(vo_params, dict):
-                            original_height = vo_params.get('h')
-                except:
-                    pass
-                
-                if quality == "auto" or not original_height:
-                    self.player['hwdec'] = 'auto-safe'
-                    try: self.player.command('vf', 'set', '')
-                    except: self.player['vf'] = ''
-                    print("🎬 [Quality] Using auto-safe hardware decoder and native quality.")
-                else:
-                    target_height = height_map.get(quality, 720)
-                    
-                    if target_height < original_height:
-                        # Включаем программное декодирование для гарантированного применения фильтра сжатия на CPU!
-                        self.player['hwdec'] = 'no'
+
+        if not (self.player and self._init):
+            HLSCache.clear()
+            return quality
+
+        try:
+            profile = QUALITY_PROFILES.get(quality, QUALITY_PROFILES["auto"])
+            # 1. Потолок буфера под профиль (НЕ выше ТЗ-200МБ)
+            self.player['cache'] = 'yes'
+            self.player['demuxer-readahead-secs'] = profile["readahead"]
+            self.player['demuxer-max-bytes'] = profile["max_bytes"]
+
+            # 2. Масштабирование видео — НА ЛЕТУ (без перезагрузки потока)
+            self._apply_video_scaling(quality)
+
+            # 3. Переключение видеодорожки (мульти-битрейт внутри потока) — на лету
+            self._apply_runtime_quality_track(quality)
+
+            # 4. ABR-выбор через HLS-прокси требует чистки кэша + релоада
+            if self._last_url:
+                HLSCache.clear()
+                pos = self.player.time_pos
+                is_live = (self.duration == 0.0)
+
+                print(f"🔄 [Quality] Reloading stream to apply HLS variant '{quality}'...")
+                self._play_url(self._last_url)
+
+                # Восстанавливаем позицию для архивов/файлов
+                if not is_live and pos is not None and pos > 0:
+                    def restore_position():
+                        time.sleep(1.2)
                         try:
-                            self.player.command('vf', 'set', f'scale=-2:{target_height}')
-                        except:
-                            self.player['vf'] = f'scale=-2:{target_height}'
-                        print(f"🎬 [Quality] Downscaling stream on CPU from {original_height}p to {target_height}p.")
-                    else:
-                        # Если выбранное качество выше или равно исходному, играем нативно на GPU без лишней нагрузки!
-                        self.player['hwdec'] = 'auto-safe'
-                        try: self.player.command('vf', 'set', '')
-                        except: self.player['vf'] = ''
-                        print(f"🎬 [Quality] Stream original height is {original_height}p. Playing natively on GPU.")
-                
-                # 3. Переключаем видеодорожку (vid) в реальном времени, если в потоке есть альтернативные варианты
-                self._apply_runtime_quality_track(quality)
-                
-                # 4. Перезапускаем поток для гарантированного применения hwdec и vf опций!
-                if self._last_url:
-                    pos = self.player.time_pos
-                    is_live = (self.duration == 0.0)
-                    
-                    print(f"🔄 [Quality] Reloading stream to apply HLS quality '{quality}'...")
-                    
-                    url_lower = self._last_url.lower()
-                    needs_proxy = any(domain in url_lower for domain in [
-                        'televizor-24', 'streaming.', 'online-television'
-                    ])
-                    
-                    if needs_proxy:
-                        proxied = get_proxied_url(self._last_url)
-                        self.player.play(proxied)
-                    else:
-                        self.player.play(self._last_url)
-                        
-                    # Восстанавливаем позицию для архивов/файлов
-                    if not is_live and pos is not None and pos > 0:
-                        def restore_position():
-                            time.sleep(1.2)
-                            try:
-                                self.player.time_pos = pos
-                                print(f"🕒 [Quality] Position restored to {pos:.1f}s")
-                            except:
-                                pass
-                        threading.Thread(target=restore_position, daemon=True).start()
-                
-            except Exception as e:
-                print(f"⚠️ Quality setting error: {e}")
-        
-        # Если качество изменено во время воспроизведения, принудительно очищаем и обновляем HLS кэш
-        HLSCache._global_cache.clear()
-        
+                            self.player.time_pos = pos
+                            print(f"🕒 [Quality] Position restored to {pos:.1f}s")
+                        except Exception:
+                            pass
+                    threading.Thread(target=restore_position, daemon=True).start()
+        except Exception as e:
+            print(f"⚠️ Quality setting error: {e}")
+
+        HLSCache.clear()
         return quality
 
-    @Slot(str, result=bool)
-    def isQualityAvailable(self, quality):
-        return quality in self._available_qualities
+    def _apply_video_scaling(self, quality):
+        """Масштабирование через vf-фильтр НА ЛЕТУ. Читает исходную высоту из MPV."""
+        try:
+            original_height = None
+            v_params = getattr(self.player, 'video_params', None)
+            if v_params and isinstance(v_params, dict):
+                original_height = v_params.get('h')
+            if not original_height:
+                vo_params = getattr(self.player, 'video_out_params', None)
+                if vo_params and isinstance(vo_params, dict):
+                    original_height = vo_params.get('h')
+
+            if quality == "auto" or not original_height:
+                self.player['hwdec'] = 'auto-safe'
+                self._set_vf("")
+                print(f"🎬 [Quality] Native quality (source: {original_height or 'unknown'}p)")
+                return
+
+            target_height = QUALITY_HEIGHTS.get(quality, 720)
+            if target_height == original_height:
+                self.player['hwdec'] = 'auto-safe'
+                self._set_vf("")
+                print(f"🎬 [Quality] Native {original_height}p — already at target")
+            elif target_height < original_height:
+                # DOWNSCALE — fast_bilinear на CPU
+                self.player['sws-flags'] = 'fast_bilinear'
+                self.player['hwdec'] = 'no'
+                self._set_vf(f'scale=-2:{target_height}')
+                print(f"🎬 [Quality] Downscaling {original_height}p → {target_height}p (fast_bilinear)")
+            else:
+                # UPSCALE — Lanczos (повышение детализации)
+                self.player['sws-flags'] = 'lanczos'
+                self.player['scale'] = 'lanczos'
+                self.player['hwdec'] = 'no'
+                self._set_vf(f'scale=-2:{target_height}')
+                print(f"🎬 [Quality] ⬆️ Upscaling {original_height}p → {target_height}p (Lanczos)")
+        except Exception as e:
+            print(f"⚠️ [Quality] scaling error: {e}")
+
+    def _set_vf(self, spec):
+        """Безопасно устанавливает vf-фильтр (пробует command, потом свойство)."""
+        try:
+            self.player.command('vf', 'set', spec)
+        except Exception:
+            try:
+                self.player['vf'] = spec
+            except Exception:
+                pass
 
     def _apply_runtime_quality_track(self, quality):
         if not self.player or not self._init:
             return
-            
         try:
-            tracks = getattr(self.player, 'track_list', None)
-            if not tracks:
-                return
-                
+            tracks = getattr(self.player, 'track_list', []) or []
             video_tracks = [t for t in tracks if t.get('type') == 'video']
             if not video_tracks or len(video_tracks) <= 1:
                 return
-                
-            # Маппинг качества на высоту кадра
-            height_map = {
-                "ultra": 2160,
-                "high": 1080,
-                "medium": 720,
-                "low": 480,
-                "minimal": 360
-            }
-            
+
             if quality == "auto":
                 self.player.vid = 'auto'
                 print("🎯 [Real-time Quality] Set vid to 'auto'")
                 return
-                
-            target_height = height_map.get(quality, 720)
-            
-            # Ищем дорожку с минимальным отклонением по высоте
-            best_track = None
-            min_diff = 999999
-            
+
+            target_height = QUALITY_HEIGHTS.get(quality, 720)
+            best_track, min_diff = None, 999999
             for t in video_tracks:
                 h = t.get('demux-h') or t.get('height')
                 if h is not None:
                     diff = abs(int(h) - target_height)
                     if diff < min_diff:
-                        min_diff = diff
-                        best_track = t
-            
+                        min_diff, best_track = diff, t
             if best_track:
                 track_id = best_track.get('id')
                 if track_id is not None:
                     self.player.vid = int(track_id)
-                    print(f"🎯 [Real-time Quality] Switched video track to vid={track_id} (height={best_track.get('demux-h') or best_track.get('height')})")
+                    print(f"🎯 [Real-time Quality] vid={track_id} "
+                          f"(h={best_track.get('demux-h') or best_track.get('height')})")
         except Exception as e:
-            print(f"⚠️ [Real-time Quality] Failed to switch video track in real-time: {e}")
+            print(f"⚠️ [Real-time Quality] track switch failed: {e}")
+
+    @Slot(str, result=bool)
+    def isQualityAvailable(self, quality):
+        return quality in self._available_qualities
 
     def _update_available_qualities_from_tracks(self):
-        # Всегда держим полный список кнопок качеств видимым по вашему требованию!
-        self._available_qualities = ["auto", "ultra", "high", "medium", "low", "minimal"]
-        self.availableQualitiesChanged.emit()
-        print("📊 [Qualities] Exposing all quality buttons unconditionally: auto, ultra, high, medium, low, minimal")
+        """
+        РЕАЛЬНЫЙ анализ доступных качеств по видеодорожкам / параметрам потока.
+        Раньше всегда возвращался полный список (мёртвый код). Теперь кнопки в меню
+        отключаются, если поток физически не поддерживает разрешение выше исходного.
+        """
+        result = ["auto"]
+        try:
+            height = None
+            if self.player and self._init:
+                # Учтём мульти-битрейт дорожки
+                tracks = getattr(self.player, 'track_list', []) or []
+                video_tracks = [t for t in tracks if t.get('type') == 'video']
+                heights = []
+                for t in video_tracks:
+                    h = t.get('demux-h') or t.get('height')
+                    if h:
+                        heights.append(int(h))
+                if heights:
+                    height = max(heights)
+                if height is None:
+                    v_params = getattr(self.player, 'video_params', None)
+                    if v_params and isinstance(v_params, dict):
+                        height = v_params.get('h')
 
+            if not height:
+                # Пока не знаем разрешение — даём полный выбор
+                self._available_qualities = ["auto", "ultra", "high", "medium", "low", "minimal"]
+                self.availableQualitiesChanged.emit()
+                print("📊 [Qualities] Resolution unknown — exposing all buttons")
+                return
+
+            # Включаем качества ДО исходного (downscale) + само исходное + upscale опции
+            order = [("minimal", 360), ("low", 480), ("medium", 720),
+                     ("high", 1080), ("ultra", 2160)]
+            for name, h in order:
+                if h <= height:
+                    result.append(name)
+            # upscale всегда доступен (Lanczos) — но только если исходник ниже
+            for name, h in order:
+                if h > height and name not in result:
+                    result.append(name)
+
+            # "auto" всегда первым
+            ordered = ["auto"] + [n for n, _ in order if n in result]
+            self._available_qualities = ordered
+            self.availableQualitiesChanged.emit()
+            print(f"📊 [Qualities] Source ~{height}p → enabled: {ordered}")
+        except Exception as e:
+            self._available_qualities = ["auto", "ultra", "high", "medium", "low", "minimal"]
+            self.availableQualitiesChanged.emit()
+            print(f"⚠️ [Qualities] analysis failed, fallback to all: {e}")
+
+    # --------------------------------------------------------
+    #  PLAY
+    # --------------------------------------------------------
     @Slot(str, str, str, str)
     def play(self, url, name="", category="", start_raw=""):
         if not HAS_MPV or not self.player or not self._init:
             print("❌ Player unavailable")
-            self._s = "❌ MPV не инициализирован"
-            self.statusChanged.emit()
+            self._set_status("❌ MPV не инициализирован")
             return
-        
-        f_url = url
-        if start_raw:
-            try:
-                ts = int(datetime.strptime(start_raw, "%Y%m%d%H%M%S").replace(timezone.utc).timestamp())
-                f_url = f"{url}?utc={ts}" if "?" not in url else f"{url}&utc={ts}"
-            except:
-                pass
-        
+
+        f_url = _append_utc(url, start_raw)
+
         print(f"🎬 Playing: {name}")
         print(f"   URL: {f_url[:80]}...")
-        
+
         self._last_url = f_url
         self._last_channel_name = name
         self._last_category = category
@@ -1654,114 +1915,73 @@ class IPTVCore(QObject):
         self._available_qualities = ["auto", "ultra", "high", "medium", "low", "minimal"]
         self.availableQualitiesChanged.emit()
         self._qualities_analyzed = False
-        self._s = "Воспроизведение..."
-        self.statusChanged.emit()
-        
-        self._target_code = "ALL"
-        self._target_name = "Глобальный"
+        self._set_status("Воспроизведение...")
+
+        self._target_code, self._target_name = "ALL", "Глобальный"
         threading.Thread(target=self._detect_country, args=(f_url, category, name), daemon=True).start()
-        
-        # Тестируем качество соединения
         threading.Thread(target=self._test_connection_quality, args=(f_url,), daemon=True).start()
-        
+
         try:
             root = self.engine.rootObjects()[0]
             if root:
                 self.player.wid = int(root.winId())
-            
-            url_lower = f_url.lower()
-            needs_proxy = any(domain in url_lower for domain in [
-                'televizor-24', 'streaming.', 'online-television'
-            ])
-            
-            is_iframe_url = 'iframe' in url_lower
-            
-            if is_iframe_url:
+
+            if 'iframe' in f_url.lower():
                 print("⚠️ iframe URL detected")
-                self._s = "⚠️ iframe URL - используйте прямой m3u8"
-                self.statusChanged.emit()
-            
-            # Запускаем локальный HLS прокси для оптимизации
-            if needs_proxy or is_iframe_url:
-                start_hls_proxy(None, core=self)
-                proxied = get_proxied_url(f_url)
-                print(f"📡 Using optimized proxy: {proxied[:60]}...")
-                self.player.play(proxied)
-            else:
-                print(f"🎬 Playing directly...")
-                self.player.play(f_url)
-            
-            # Устанавливаем оптимальные параметры для потока
+                self._set_status("⚠️ iframe URL - используйте прямой m3u8")
+
+            self._play_url(f_url)
             self._apply_stream_optimizations()
-            
         except Exception as e:
             print(f"❌ Play error: {e}")
-            self._s = f"❌ Ошибка воспроизведения: {type(e).__name__}"
-            self.statusChanged.emit()
+            self._set_status(f"❌ Ошибка воспроизведения: {type(e).__name__}")
 
     def _apply_stream_optimizations(self):
-        """Применяет оптимизации для текущего потока"""
-        if not HAS_MPV or not self.player:
+        """Инфраструктурные лимиты (потолок кэша — НЕ урезает качество)."""
+        if not (HAS_MPV and self.player):
             return
-            
         try:
-            # Оптимизация для live потоков и keep-alive соединений
-            try:
-                self.player['live-keepalive'] = 'yes'
-            except:
-                pass
-                
-            try:
-                self.player['force-seekable'] = 'yes'
-            except:
-                pass
-            
-            # Таймауты
-            try:
-                self.player['network-timeout'] = '30'
-            except:
-                pass
-                
-            try:
-                self.player['stream-timeout'] = '15'
-            except:
-                pass
-            
-            # Настройка адаптивного буфера до 60 секунд
-            try:
-                self.player['demuxer-readahead-secs'] = '60'
-                self.player['cache'] = 'yes'
-            except:
-                pass
-                
-            # Принудительно применяем текущее выбранное пользователем качество к новому потоку
+            p = self.player
+            # Единый источник правды — CacheConfig (200МБ/60с, ТЗ)
+            p['cache'] = 'yes'
+            p['cache-secs'] = CacheConfig.CACHE_SECS
+            p['demuxer-max-bytes'] = CacheConfig.MAX_BYTES
+            p['demuxer-max-back-bytes'] = CacheConfig.MAX_BACK_BYTES
+            p['demuxer-readahead-secs'] = CacheConfig.READAHEAD_SECS
+            p['demuxer-hysteresis-secs'] = CacheConfig.HYSTERESIS_SECS
+            p['network-timeout'] = CacheConfig.NETWORK_TIMEOUT
+            p['live-keepalive'] = 'yes'
+            p['force-seekable'] = 'yes'
+
             try:
                 self.setQuality(self._current_quality)
             except Exception as q_err:
                 print(f"⚠️ Failed to apply quality on play: {q_err}")
-                
-            # Запускаем динамический анализ разрешения через 2.5 секунды после начала воспроизведения
+
             try:
                 QTimer.singleShot(2500, self._update_available_qualities_from_tracks)
-            except:
+            except Exception:
                 pass
-                
-            print("[Optimizer] Applied stream optimizations")
+
+            print(f"[Optimizer] ✅ Cache capped ({CacheConfig.MAX_BYTES}/{CacheConfig.CACHE_SECS}s, "
+                  f"hysteresis={CacheConfig.HYSTERESIS_SECS}s); quality/subs/audio — выбор пользователя")
         except Exception as e:
             print(f"[Optimizer] Optimization error: {e}")
 
     def _detect_country(self, url, cat, name):
         code, cn = detect_country(cat, name)
-        if code == "ALL":
+        if code == "ALL" and not self._skip_country_detect:
             try:
                 host = url.split("://")[-1].split("/")[0].split(":")[0]
-                if host and not host.startswith("127.") and not host.startswith("192.168.") and not host.startswith("10."):
+                if host and not host.startswith(("127.", "192.168.", "10.")):
                     ip = socket.gethostbyname(host)
                     cc, nn = get_ip_country(ip)
                     if cc != "ALL":
                         code, cn = cc, nn
-            except:
+            except Exception:
                 pass
+        elif code == "ALL" and self._skip_country_detect:
+            print("[SAVER] Пропускаем DNS+HTTP для определения страны канала")
         self._target_code = code
         self._target_name = cn
         print(f"🎯 Country: {code} ({cn})")
@@ -1788,17 +2008,10 @@ class IPTVCore(QObject):
         if HAS_MPV and self.player and self._init:
             try:
                 self.player.stop()
-                self._s = "Ready"
-                self.statusChanged.emit()
+                self._set_status("Ready")
                 self.playingChanged.emit(False)
-            except:
+            except Exception:
                 pass
-
-    @Property(str, notify=statusChanged)
-    def targetCode(self): return self._target_code
-
-    @Property(str, notify=statusChanged)
-    def targetName(self): return self._target_name
 
     @Slot(str, result=str)
     def getFallback(self, channel_name):
@@ -1807,17 +2020,23 @@ class IPTVCore(QObject):
             print(f"[Player] Trying fallback: {fallback[:50]}...")
             try:
                 self.player.play(fallback)
-                self._s = "Использую резервный поток"
-                self.statusChanged.emit()
+                self._set_status("Использую резервный поток")
                 return fallback
-            except:
+            except Exception:
                 pass
-        
         return None
 
-    @Property(QObject, constant=True)
-    def epgModel(self):
-        return self._em
+
+def _append_utc(url, start_raw):
+    """Превращает EPG-метку старта в параметр utc= архивной ссылки (общая логика)."""
+    if not start_raw:
+        return url
+    try:
+        from datetime import timezone
+        ts = int(datetime.strptime(start_raw, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc).timestamp())
+        return f"{url}?utc={ts}" if "?" not in url else f"{url}&utc={ts}"
+    except Exception:
+        return url
 
 
 if __name__ == "__main__":
