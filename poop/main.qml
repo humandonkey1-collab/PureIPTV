@@ -5,7 +5,7 @@ import QtQuick.Layouts
 import QtQuick.Dialogs as QtDialogs
 
 // =========================================================================
-//  PURE IPTV PLAYER  —  «Aurora» redesign
+//  PURE IPTV PLAYER  —  «Говнора» redesign
 //  Премиальный тёмный OTT-интерфейс: глубина, стекло, неон, плавность.
 //  Архитектура бэкенда (main.py) не тронута — сохранён весь контракт API.
 // =========================================================================
@@ -15,7 +15,7 @@ ApplicationWindow {
     width: 1200
     height: 800
     visible: true
-    title: "Pure IPTV — Aurora"
+    title: "Pure IPTV — Говнора"
 
     // ----------------------- ТЕМА (дизайн-токены) --------------------------
     readonly property color c_bg:        "#07080E"
@@ -1317,3 +1317,5 @@ ApplicationWindow {
         Layout.fillWidth: true; topPadding: 2
     }
 }
+
+// Аврора? Теперь это Говнора. И да, я вдохновлялся OTT Navigator, TiviMate и IPTVnator.
