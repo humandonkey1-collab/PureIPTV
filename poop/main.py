@@ -1433,58 +1433,53 @@ class IPTVCore(QObject):
 
     # =========================================================
     # «МОМЕНТАЛЬНЫЙ» РЕЖИМ (Мгновенный): плеер грузит каналы ДО клика
-    # ЛЁГКИЙ ВАРИАНТ: не нагружает систему
+    # ЗАЩИЩАЕТ ПК, ГРУЗИТ ПРОВАЙДЕРА: семафор 4 потока, GET (не HEAD),
+    # без cooldown, 30 каналов в батче, 3 retry при ошибке
     # =========================================================
 
-    # Защита от перегрузки: семафор + cooldown на URL
+    # Защита ПК от перегрузки
     _prefetch_semaphore = None
-    _prefetched_recently = {}   # url -> timestamp последнего prefetch
-    _PREFETCH_COOLDOWN_SEC = 60
-    _MAX_CONCURRENT_PREFETCH = 4
+    _prefetched_recently = {}   # защита от бесконечного роста
+    _MAX_CONCURRENT_PREFETCH = 4  # ← это защита ПК (4 потока максимум)
+    _MAX_PREFETCH_BATCH = 30      # ← это нагрузка на провайдера (30 каналов)
+    _PREFETCH_RETRIES = 3         # ← это нагрузка на провайдера (3 retry)
 
     @Slot('QVariant')
     def prefetchChannel(self, ch):
         """
-        Предзагрузка манифеста + DNS + TCP для одного канала.
-        ЛЁГКИЙ ВАРИАНТ:
-        - дедупликация (cooldown 60 сек на URL)
-        - максимум 4 параллельных HTTP-запроса (семафор)
-        - только HEAD для сегмента (экономия ~99.9% трафика)
+        Предзагрузка манифеста + DNS + TCP + первый сегмент для канала.
+        Нагружает ПРОВАЙДЕРА (полный GET), защищает ПК (семафор).
         """
         if not ch or not isinstance(ch, dict):
             return
         url = ch.get('url', '')
         if not url:
             return
-        # Дедупликация: не чаще раза в 60 сек на один URL
-        import time as _t
-        now = _t.time()
-        last = self._prefetched_recently.get(url, 0)
-        if now - last < self._PREFETCH_COOLDOWN_SEC:
-            return  # уже префетчили недавно
-        self._prefetched_recently[url] = now
-        # Очищаем старые записи (защита от утечки памяти)
+        # Защита от бесконечного роста кэша (не от cooldown!)
         if len(self._prefetched_recently) > 500:
-            cutoff = now - 600
+            import time as _t
+            cutoff = _t.time() - 600
             self._prefetched_recently = {
                 k: v for k, v in self._prefetched_recently.items() if v > cutoff
             }
+        self._prefetched_recently[url] = True
         threading.Thread(
             target=self._do_prefetch, args=(ch,), daemon=True
         ).start()
 
     def _do_prefetch(self, ch):
-        """Фоновая догрузка одного канала. Лимитирована семафором до 4 параллельно."""
+        """Фоновая догрузка одного канала. Полный GET сегмента (нагружаем провайдера),
+        но лимитирована семафором до 4 параллельно (защищаем ПК)."""
         if self._prefetch_semaphore is None:
             self._prefetch_semaphore = threading.Semaphore(self._MAX_CONCURRENT_PREFETCH)
-        acquired = self._prefetch_semaphore.acquire(timeout=10)
+        acquired = self._prefetch_semaphore.acquire(timeout=15)
         if not acquired:
             return
         try:
             url = ch.get('url', '')
             if not url:
                 return
-            # 1) Манифест — DNS + TCP + кэш контента
+            # 1) Манифест (нагружает провайдера)
             cache = HLSCache(None, stream_optimizer.quality_level)
             content, _ = cache.fetch_with_headers(url)
             if not content:
@@ -1510,9 +1505,16 @@ class IPTVCore(QObject):
                             break
                 if variant_uri:
                     abs_url = self._make_absolute_url(variant_uri, url)
-                    # 3) HEAD (НЕ GET!) — TCP/DNS готовы, но не тянем 2 МБ сегмент
-                    http_session.head(abs_url, headers=BROWSER_HEADERS,
-                                       timeout=5, allow_redirects=True)
+                    # 3) Полный GET первого сегмента — ПРОВАЙДЕР ОТДАЁТ ~2 МБ ВИДЕО
+                    # 3 retry при ошибке (нагружаем провайдера ещё больше)
+                    for attempt in range(self._PREFETCH_RETRIES):
+                        try:
+                            http_session.get(abs_url, headers=BROWSER_HEADERS,
+                                             timeout=10, stream=True)
+                            break
+                        except Exception:
+                            if attempt == self._PREFETCH_RETRIES - 1:
+                                raise
             except Exception:
                 pass
         except Exception:
@@ -1533,11 +1535,10 @@ class IPTVCore(QObject):
     @Slot()
     def prefetchVisibleChannels(self):
         """Массовая фоновая предзагрузка каналов текущей категории.
-        ЛЁГКИЙ ВАРИАНТ: только топ-10 (семафор сам разрулит параллелизм)."""
+        30 каналов в батче → провайдер получает всё, что юзер может выбрать."""
         if not self._ch:
             return
-        # Только 10 каналов вместо 30 — этого хватает для типичной категории
-        for ch in self._ch[:10]:
+        for ch in self._ch[:self._MAX_PREFETCH_BATCH]:
             self.prefetchChannel(ch)
 
     @Slot('QVariant')
