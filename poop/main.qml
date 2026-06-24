@@ -673,6 +673,44 @@ ApplicationWindow {
             Component.onCompleted: {
                 refreshChannels()
                 clist.forceActiveFocus() // Навешиваем фокус на список каналов при входе
+                // === Мгновенный режим: фоновая предзагрузка каналов текущей категории ===
+                backend.prefetchVisibleChannels()
+            }
+
+            // Плашка-подсказка предсказания (мигает снизу и исчезает через 3 сек)
+            Rectangle {
+                id: statusTip
+                width: Math.min(420, window.width * 0.9)
+                height: 38 * window.scaleFactor
+                radius: 19 * window.scaleFactor
+                color: "#CC1B5E20"
+                border.color: "#00E676"
+                border.width: 1
+                anchors.bottom: parent.bottom
+                anchors.horizontalCenter: parent.horizontalCenter
+                anchors.bottomMargin: 20 * window.scaleFactor
+                visible: false
+                z: 999
+
+                Label {
+                    anchors.centerIn: parent
+                    text: statusTip.tipText
+                    color: "#A5D6A7"
+                    font.pixelSize: window.fontSizeSub
+                    font.bold: true
+                }
+
+                property string tipText: ""
+                function show(msg) {
+                    tipText = msg
+                    visible = true
+                    hideTimer.restart()
+                }
+                Timer {
+                    id: hideTimer
+                    interval: 3000
+                    onTriggered: statusTip.visible = false
+                }
             }
 
             RowLayout {
@@ -721,6 +759,8 @@ ApplicationWindow {
                                 catList.currentIndex = index
                                 window.activeCategory = modelData
                                 mainPageInstance.refreshChannels()
+                                // === Мгновенный режим: предзагрузить новые каналы ===
+                                backend.prefetchVisibleChannels()
                             }
 
                             onClicked: selectCategory()
@@ -844,8 +884,39 @@ ApplicationWindow {
                                 window.selCh = modelData
                                 window.currentChIndex = index
                                 backend.updateEPG(modelData.id)
+                                // === Мгновенный режим: запоминаем клик для предсказаний ===
+                                backend.recordChannelClick(modelData)
                                 backend.play(modelData.url, modelData.name, modelData.group, "")
+                                // === Умный угадыватель: топ-N кандидатов префетчатся в фоне ===
+                                var pred = backend.predictNextChannel(modelData)
+                                if (pred) {
+                                    var msg = pred.confidence >= 30
+                                        ? ("⚡ Вероятно следующий: " + pred.name +
+                                           " (" + pred.confidence + "%, источник: " + pred.source + ")")
+                                        : ("🔥 Готово к мгновенному: " + pred.candidates_count +
+                                           " каналов на основе твоих привычек")
+                                    console.log(msg)
+                                }
                                 stack.push(playerPage)
+                            }
+
+                            // === Мгновенный режим: предзагрузка при наведении/фокусе ===
+                            onHoveredChanged: {
+                                if (hovered || activeFocus) {
+                                    backend.prefetchChannel(modelData)
+                                }
+                            }
+                            onActiveFocusChanged: {
+                                if (activeFocus) {
+                                    backend.prefetchChannel(modelData)
+                                    // Предсказываем уже на фокусе — заранее догреваем
+                                    var pred = backend.predictNextChannel(modelData)
+                                    if (pred && pred.confidence >= 30) {
+                                        statusTip.show("⚡ Вероятно: " + pred.name)
+                                    } else if (pred) {
+                                        statusTip.show("🔥 " + pred.candidates_count + " каналов готовы")
+                                    }
+                                }
                             }
 
                             onClicked: selectChannel()

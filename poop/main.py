@@ -1112,6 +1112,11 @@ class IPTVCore(QObject):
             user TEXT, pwd TEXT, mac TEXT, channels TEXT, epg_db TEXT)""")
         self.db.execute("""CREATE TABLE IF NOT EXISTS favorites (
             playlist_id INTEGER, channel_id TEXT, PRIMARY KEY (playlist_id, channel_id))""")
+        # === «Мгновенный» режим: история кликов для предсказания ===
+        self.db.execute("""CREATE TABLE IF NOT EXISTS click_history (
+            id INTEGER PRIMARY KEY, ts INTEGER, channel_id TEXT,
+            channel_name TEXT, category TEXT, playlist_id INTEGER,
+            hour INTEGER, weekday INTEGER)""")
         self.db.commit()
 
     def _schedule_reconnect(self):
@@ -1426,6 +1431,269 @@ class IPTVCore(QObject):
     def isFavorite(self, cid):
         return cid in self._fav_ids
 
+    # =========================================================
+    # «МОМЕНТАЛЬНЫЙ» РЕЖИМ (Мгновенный): плеер грузит каналы ДО клика
+    # ЛЁГКИЙ ВАРИАНТ: не нагружает систему
+    # =========================================================
+
+    # Защита от перегрузки: семафор + cooldown на URL
+    _prefetch_semaphore = None
+    _prefetched_recently = {}   # url -> timestamp последнего prefetch
+    _PREFETCH_COOLDOWN_SEC = 60
+    _MAX_CONCURRENT_PREFETCH = 4
+
+    @Slot('QVariant')
+    def prefetchChannel(self, ch):
+        """
+        Предзагрузка манифеста + DNS + TCP для одного канала.
+        ЛЁГКИЙ ВАРИАНТ:
+        - дедупликация (cooldown 60 сек на URL)
+        - максимум 4 параллельных HTTP-запроса (семафор)
+        - только HEAD для сегмента (экономия ~99.9% трафика)
+        """
+        if not ch or not isinstance(ch, dict):
+            return
+        url = ch.get('url', '')
+        if not url:
+            return
+        # Дедупликация: не чаще раза в 60 сек на один URL
+        import time as _t
+        now = _t.time()
+        last = self._prefetched_recently.get(url, 0)
+        if now - last < self._PREFETCH_COOLDOWN_SEC:
+            return  # уже префетчили недавно
+        self._prefetched_recently[url] = now
+        # Очищаем старые записи (защита от утечки памяти)
+        if len(self._prefetched_recently) > 500:
+            cutoff = now - 600
+            self._prefetched_recently = {
+                k: v for k, v in self._prefetched_recently.items() if v > cutoff
+            }
+        threading.Thread(
+            target=self._do_prefetch, args=(ch,), daemon=True
+        ).start()
+
+    def _do_prefetch(self, ch):
+        """Фоновая догрузка одного канала. Лимитирована семафором до 4 параллельно."""
+        if self._prefetch_semaphore is None:
+            self._prefetch_semaphore = threading.Semaphore(self._MAX_CONCURRENT_PREFETCH)
+        acquired = self._prefetch_semaphore.acquire(timeout=10)
+        if not acquired:
+            return
+        try:
+            url = ch.get('url', '')
+            if not url:
+                return
+            # 1) Манифест — DNS + TCP + кэш контента
+            cache = HLSCache(None, stream_optimizer.quality_level)
+            content, _ = cache.fetch_with_headers(url)
+            if not content:
+                return
+            # 2) Найдём URI варианта или первого сегмента
+            try:
+                lines = content.split('\n')
+                variant_uri = None
+                for i, line in enumerate(lines):
+                    if '#EXT-X-STREAM-INF' in line:
+                        for j in range(i + 1, len(lines)):
+                            cand = lines[j].strip()
+                            if cand and not cand.startswith('#'):
+                                variant_uri = cand
+                                break
+                        if variant_uri:
+                            break
+                if not variant_uri:
+                    for line in lines:
+                        s = line.strip()
+                        if s and not s.startswith('#') and '.ts' in s.lower():
+                            variant_uri = s
+                            break
+                if variant_uri:
+                    abs_url = self._make_absolute_url(variant_uri, url)
+                    # 3) HEAD (НЕ GET!) — TCP/DNS готовы, но не тянем 2 МБ сегмент
+                    http_session.head(abs_url, headers=BROWSER_HEADERS,
+                                       timeout=5, allow_redirects=True)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        finally:
+            self._prefetch_semaphore.release()
+
+    def _make_absolute_url(self, candidate, base):
+        """Превращает относительный URL в абсолютный, опираясь на base."""
+        if candidate.startswith('http://') or candidate.startswith('https://'):
+            return candidate
+        if candidate.startswith('/'):
+            from urllib.parse import urlparse as up
+            p = up(base)
+            return f"{p.scheme}://{p.netloc}{candidate}"
+        return base.rsplit('/', 1)[0] + '/' + candidate
+
+    @Slot()
+    def prefetchVisibleChannels(self):
+        """Массовая фоновая предзагрузка каналов текущей категории.
+        ЛЁГКИЙ ВАРИАНТ: только топ-10 (семафор сам разрулит параллелизм)."""
+        if not self._ch:
+            return
+        # Только 10 каналов вместо 30 — этого хватает для типичной категории
+        for ch in self._ch[:10]:
+            self.prefetchChannel(ch)
+
+    @Slot('QVariant')
+    def recordChannelClick(self, ch):
+        """Записать клик по каналу в историю (для предсказаний)."""
+        try:
+            if not ch or not isinstance(ch, dict):
+                return
+            import time as _t
+            now = _t.time()
+            ts_struct = _t.localtime(now)
+            self.db.execute(
+                "INSERT INTO click_history (ts, channel_id, channel_name, category, playlist_id, hour, weekday) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    int(now),
+                    str(ch.get('id', '')),
+                    str(ch.get('name', '')),
+                    str(ch.get('group', '')),
+                    int(self.current_playlist_id) if self.current_playlist_id else 0,
+                    ts_struct.tm_hour,
+                    ts_struct.tm_wday,
+                ),
+            )
+            self.db.commit()
+        except Exception as e:
+            print(f"[Predictor] record error: {e}")
+
+    @Slot('QVariant', result='QVariant')
+    def predictNextChannel(self, current_ch):
+        """Многоступенчатое предсказание следующего канала + префетч топ-N кандидатов.
+        Учитывает: последовательность, время суток, день недели, категорию.
+        Возвращает топ-1 как «основное» предсказание + префетчит несколько альтернатив,
+        чтобы при непредсказуемом поведении ЛЮБОЙ клик был мгновенным."""
+        try:
+            if not current_ch or not isinstance(current_ch, dict):
+                return None
+            import time as _t
+            cur_id = str(current_ch.get('id', ''))
+            cur_cat = str(current_ch.get('group', ''))
+            now_struct = _t.localtime(_t.time())
+            cur_hour = now_struct.tm_hour
+            cur_wday = now_struct.tm_wday
+
+            # === Собираем кандидатов из 4 стратегий, с очками ===
+            # candidates[id] = (name, category, score, source)
+            candidates = {}
+
+            def _add(cid, name, cat, score, source):
+                if not cid or cid == cur_id:
+                    return
+                if cid in candidates:
+                    old = candidates[cid]
+                    # Суммируем очки от разных стратегий
+                    candidates[cid] = (old[0], old[1], old[2] + score, source + "+" + old[3])
+                else:
+                    candidates[cid] = (name, cat, score, source)
+
+            # --- Стратегия 1: последовательная (только при ≥3 подтверждений!) ---
+            seq_rows = self.db.execute(
+                """
+                SELECT ch2.channel_id, ch2.channel_name, ch2.category, COUNT(*) as cnt
+                FROM click_history ch1
+                JOIN click_history ch2 ON ch2.ts > ch1.ts
+                                       AND ch2.ts < ch1.ts + 120
+                                       AND ch2.channel_id != ch1.channel_id
+                WHERE ch1.channel_id = ?
+                  AND ABS(ch1.hour - ?) <= 2
+                GROUP BY ch2.channel_id
+                ORDER BY cnt DESC
+                LIMIT 5
+                """,
+                (cur_id, cur_hour),
+            ).fetchall()
+            for r in seq_rows:
+                if r[3] >= 3:
+                    _add(r[0], r[1], r[2], r[3] * 10, "seq")
+
+            # --- Стратегия 2: популярный в этот час (±1 час) ---
+            hour_rows = self.db.execute(
+                """
+                SELECT channel_id, channel_name, category, COUNT(*) as cnt
+                FROM click_history
+                WHERE ABS(hour - ?) <= 1
+                GROUP BY channel_id
+                ORDER BY cnt DESC
+                LIMIT 5
+                """,
+                (cur_hour,),
+            ).fetchall()
+            for r in hour_rows:
+                _add(r[0], r[1], r[2], r[3] * 2, "hour")
+
+            # --- Стратегия 3: популярный в этот день недели ---
+            wday_rows = self.db.execute(
+                """
+                SELECT channel_id, channel_name, category, COUNT(*) as cnt
+                FROM click_history
+                WHERE weekday = ?
+                GROUP BY channel_id
+                ORDER BY cnt DESC
+                LIMIT 5
+                """,
+                (cur_wday,),
+            ).fetchall()
+            for r in wday_rows:
+                _add(r[0], r[1], r[2], r[3], "weekday")
+
+            # --- Стратегия 4: из той же категории ---
+            if cur_cat:
+                cat_rows = self.db.execute(
+                    """
+                    SELECT channel_id, channel_name, COUNT(*) as cnt
+                    FROM click_history
+                    WHERE category = ?
+                    GROUP BY channel_id
+                    ORDER BY cnt DESC
+                    LIMIT 3
+                    """,
+                    (cur_cat,),
+                ).fetchall()
+                for r in cat_rows:
+                    _add(r[0], r[1], cur_cat, r[3] * 0.5, "cat")
+
+            if not candidates:
+                return None
+
+            # Сортируем по очкам, префетчим топ-5 (мгновенное переключение на ЛЮБОЙ из них)
+            sorted_cands = sorted(candidates.items(), key=lambda x: -x[1][2])
+            top5 = sorted_cands[:5]
+            prefetched_count = 0
+            for cid, (name, cat, score, src) in top5:
+                for ch in self._ch:
+                    if ch.get('id') == cid:
+                        self.prefetchChannel(ch)
+                        prefetched_count += 1
+                        break
+
+            # Возвращаем топ-1 как основное предсказание
+            top_id, (top_name, top_cat, top_score, top_src) = top5[0]
+            # Шкала уверенности 0..100
+            confidence = min(int(top_score), 100)
+            return {
+                'id': top_id,
+                'name': top_name,
+                'category': top_cat,
+                'confidence': confidence,
+                'source': top_src,
+                'candidates_count': len(top5),
+            }
+        except Exception as e:
+            print(f"[Predictor] predict error: {e}")
+        return None
+
+    # =========================================================
+
     @Slot(str, str, str, str, str, str, str)
     def addPlaylist(self, name, proto, host, epg, user, pwd, mac):
         if not name.strip() or not host.strip():
@@ -1598,24 +1866,45 @@ class IPTVCore(QObject):
                     self.player['hwdec'] = 'auto-safe'
                     try: self.player.command('vf', 'set', '')
                     except: self.player['vf'] = ''
-                    print("🎬 [Quality] Using auto-safe hardware decoder and native quality.")
+                    print(f"🎬 [Quality] Native quality (source: {original_height or 'unknown'}p)")
                 else:
                     target_height = height_map.get(quality, 720)
                     
-                    if target_height < original_height:
-                        # Включаем программное декодирование для гарантированного применения фильтра сжатия на CPU!
-                        self.player['hwdec'] = 'no'
-                        try:
-                            self.player.command('vf', 'set', f'scale=-2:{target_height}')
-                        except:
-                            self.player['vf'] = f'scale=-2:{target_height}'
-                        print(f"🎬 [Quality] Downscaling stream on CPU from {original_height}p to {target_height}p.")
-                    else:
-                        # Если выбранное качество выше или равно исходному, играем нативно на GPU без лишней нагрузки!
+                    if target_height == original_height:
+                        # Уже на целевом разрешении — играем нативно, без vf фильтра
                         self.player['hwdec'] = 'auto-safe'
                         try: self.player.command('vf', 'set', '')
                         except: self.player['vf'] = ''
-                        print(f"🎬 [Quality] Stream original height is {original_height}p. Playing natively on GPU.")
+                        print(f"🎬 [Quality] Native {original_height}p — already at target, no scaling needed")
+                    
+                    elif target_height < original_height:
+                        # === DOWNSCALE: качество ниже исходника ===
+                        # Bilinear на CPU — быстро и достаточно для сжатия
+                        try: self.player['sws-flags'] = 'fast_bilinear'
+                        except: pass
+                        try:
+                            self.player['hwdec'] = 'no'
+                            self.player.command('vf', 'set', f'scale=-2:{target_height}')
+                        except:
+                            self.player['vf'] = f'scale=-2:{target_height}'
+                        print(f"🎬 [Quality] Downscaling {original_height}p → {target_height}p on CPU (fast_bilinear)")
+                    
+                    else:
+                        # === UPSCALE: качество ВЫШЕ исходника ===
+                        # Используем Lanczos — высококачественный алгоритм, который
+                        # реально повышает детализацию кадра (НЕ тупое растяжение окна).
+                        # scale=-2:N сохраняет пропорции (чётное число = кратно 2).
+                        try: self.player['sws-flags'] = 'lanczos'        # CPU-скалер
+                        except: pass
+                        try: self.player['scale'] = 'lanczos'            # GPU-скалер (vo=gpu)
+                        except: pass
+                        try:
+                            # hwdec=no нужен, чтобы vf scale гарантированно применился
+                            self.player['hwdec'] = 'no'
+                            self.player.command('vf', 'set', f'scale=-2:{target_height}')
+                        except:
+                            self.player['vf'] = f'scale=-2:{target_height}'
+                        print(f"🎬 [Quality] ⬆️ Upscaling {original_height}p → {target_height}p on CPU (Lanczos)")
                 
                 # 3. Переключаем видеодорожку (vid) в реальном времени, если в потоке есть альтернативные варианты
                 self._apply_runtime_quality_track(quality)
