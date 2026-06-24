@@ -971,7 +971,6 @@ class IPTVCore(QObject):
                     keep_open_pause='no',
                     hr_seek='yes',
                     network_timeout='20',
-                    stream_timeout='15',
 
                     cache='yes',
                     cache_secs='60',                # максимум 60 секунд видео
@@ -1661,7 +1660,7 @@ class IPTVCore(QObject):
                     (cur_cat,),
                 ).fetchall()
                 for r in cat_rows:
-                    _add(r[0], r[1], cur_cat, r[3] * 0.5, "cat")
+                    _add(r[0], r[1], cur_cat, r[2] * 0.5, "cat")
 
             if not candidates:
                 return None
@@ -2106,8 +2105,6 @@ class IPTVCore(QObject):
             try: self.player['force-seekable'] = 'yes'
             except: pass
             try: self.player['network-timeout'] = '20'
-            except: pass
-            try: self.player['stream-timeout'] = '15'
             except: pass
 
             # Применяем текущее выбранное пользователем качество

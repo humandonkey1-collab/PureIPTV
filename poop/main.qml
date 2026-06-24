@@ -842,7 +842,7 @@ ApplicationWindow {
                                 }
                                 border.color: parent.isActive ? c_accent : (hovered ? Qt.rgba(0.145, 0.902, 0.643, 0.45) : "transparent")
                                 border.width: parent.isActive ? 1.5 : 1
-                                Rectangle { anchors.left: parent.left; anchors.verticalCenter: parent.verticalCenter; width: 3; height: 30; radius: 1.5; color: c_accent; visible: parent.isActive }
+                                Rectangle { anchors.left: parent.left; anchors.verticalCenter: parent.verticalCenter; width: 3; height: 30; radius: 1.5; color: c_accent; visible: parent.parent.isActive }
                                 Behavior on color { ColorAnimation { duration: 130 } }
                             }
 
