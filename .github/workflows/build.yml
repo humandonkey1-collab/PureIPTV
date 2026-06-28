@@ -1,4 +1,4 @@
-name: Pure IPTV — ultra compact
+name: "🔥 Pure IPTV — Python → .asm → .exe"
 
 on:
   push:
@@ -10,68 +10,196 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - uses: actions/checkout@v4
+      # ─────────────────────────────────────────────────────────────
+      # 0. БАЗОВАЯ ПОДГОТОВКА
+      # ─────────────────────────────────────────────────────────────
+      - name: "📥 Checkout repository"
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: "🔵 Set up Python 3.11"
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install deps
+      - name: "📦 Install dependencies"
         run: |
-          pip install nuitka zstandard
-          pip install PySide6-Essentials requests python-mpv
+          python -m pip install --upgrade pip
+          pip install PySide6 requests python-mpv
+          pip install nuitka
 
-      - name: Nuitka standalone + LTO
+      # ─────────────────────────────────────────────────────────────
+      # 1. PYTHON → БАЙТКОД .ASM  (dis-дизассемблер)
+      #    Первая трансформация: исходный Python-код превращается
+      #    в мнемоники виртуальной машины CPython — это уже .asm!
+      # ─────────────────────────────────────────────────────────────
+      - name: "🧬 STEP 1 — Python bytecode → .asm (dis.dis)"
+        shell: pwsh
         run: |
+          python -c @'
+import dis, sys, io, os
+
+def disassemble_to_asm(src_path, out_path, label):
+    with open(src_path, 'r', encoding='utf-8') as f:
+        code = compile(f.read(), src_path, 'exec')
+
+    with open(out_path, 'w', encoding='utf-8') as out:
+        out.write(f'; {"="*65}\n')
+        out.write(f'; Pure IPTV — {label}\n')
+        out.write(f'; Source: {src_path}\n')
+        out.write(f'; Tool:   Python {sys.version.split()[0]} dis module\n')
+        out.write(f'; {"="*65}\n\n')
+
+        old = sys.stdout
+        sys.stdout = io.StringIO()
+        dis.dis(code)
+        result = sys.stdout.getvalue()
+        sys.stdout = old
+        out.write(result)
+
+    size = os.path.getsize(out_path)
+    print(f'✅ {out_path}  ({size/1024:.1f} KB)')
+
+disassemble_to_asm('main.py', 'PureIPTV_bytecode.asm', 'Python Bytecode Disassembly')
+'@
+
+      # ─────────────────────────────────────────────────────────────
+      # 2. PYTHON → C++ → ASM → .EXE  (Nuitka + MSVC)
+      #    Nuitka компилирует Python в C++, затем MSVC/cl.exe
+      #    превращает C++ в настоящий машинный код.
+      #    Флаги MSVC /FA /Fa генерируют .asm-файлы каждого .cpp.
+      # ─────────────────────────────────────────────────────────────
+      - name: "🏗️ STEP 2 — Nuitka: Python → C++ → MSVC → EXE"
+        shell: pwsh
+        run: |
+          # Устанавливаем переменные, чтобы MSVC генерировал .asm листинги
+          # /FA  — assembly listing (code + machine code)
+          # /Fa"$pwd\build\asm\" — куда складывать .asm файлы
+          $asmDir = "$pwd\build\nuitka-asm"
+          New-Item -ItemType Directory -Force -Path $asmDir | Out-Null
+
+          # Nuitka сама управляет MSVC; мы не можем напрямую передать /FA,
+          # но можем установить флаги через CFLAGS (Nuitka их подхватывает)
+          $env:CFLAGS = "/FA /Fa$asmDir\"
+          $env:CXXFLAGS = "/FA /Fa$asmDir\"
+
           python -m nuitka `
             --standalone `
-            --lto=yes `
+            --onefile `
             --enable-plugin=pyside6 `
-            --include-qt-plugins=sensible,qml `
             --windows-console-mode=disable `
             --include-data-dir=mpv=mpv `
             --include-data-file=main.qml=main.qml `
-            --noinclude-pytest-mode=nofollow `
-            --noinclude-unittest-mode=nofollow `
-            --noinclude-setuptools-mode=nofollow `
+            --include-qt-plugins=qml `
             --assume-yes-for-downloads `
             --output-dir=build `
             main.py
 
-      - name: Find .exe and folder
+          Write-Host "`n✅ Nuitka build complete"
+
+      # ─────────────────────────────────────────────────────────────
+      # 3. MSVC DUMPBIN: .EXE → x86-64 .ASM
+      #    Дизассемблируем готовый исполняемый файл обратно в
+      #    настоящий ассемблер x86-64 — полный цикл: .py → .asm → .exe → .asm
+      # ─────────────────────────────────────────────────────────────
+      - name: "🛠️ STEP 3 — Set up MSVC tools (dumpbin)"
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: "🔬 STEP 4 — dumpbin /DISASM → x86-64 .asm"
         shell: pwsh
         run: |
-          $exe = Get-ChildItem -Path build -Recurse -Filter "main.exe" | Select-Object -First 1
-          if (-not $exe) { throw "No exe" }
-          $dir = $exe.Directory.FullName
-          $before = (Get-ChildItem -Path $dir -Recurse | Measure-Object -Property Length -Sum).Sum
-          "EXE_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "BEFORE=$([math]::Round($before/1MB, 1))" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          Write-Host "Folder: $dir"
-          Write-Host "Before UPX: $([math]::Round($before/1MB, 1)) MB"
+          $exePath = Get-ChildItem -Path build -Recurse -Filter "*.exe" | Select-Object -First 1
+          if (-not $exePath) { throw "❌ No EXE found!" }
 
-      - name: UPX all DLLs and EXEs
-        run: |
-          curl -sL https://github.com/upx/upx/releases/download/v4.2.4/upx-4.2.4-win64.zip -o upx.zip
-          tar -xf upx.zip
-          $upx = "$pwd\upx-4.2.4-win64\upx.exe"
-          Get-ChildItem -Path "$env:EXE_DIR" -Include *.dll,*.exe,*.pyd -Recurse | ForEach-Object {
-            & $upx --best --lzma $_.FullName --force --no-progress 2>&1 | Out-Null
+          Write-Host "🎯 EXE: $($exePath.FullName)"
+          $exeSize = (Get-Item $exePath.FullName).Length
+          Write-Host "   Size: $([math]::Round($exeSize/1MB, 2)) MB"
+          echo "EXE_PATH=$($exePath.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+          # dumpbin /DISASM: дьявол кроется в деталях
+          Write-Host "🔬 Disassembling to x86-64 assembly (this may take a while)..."
+
+          $asmOut = "PureIPTV_x86-64.asm"
+          dumpbin /DISASM "$($exePath.FullName)" 2>$null | Out-File -FilePath $asmOut -Encoding ascii
+
+          if ((Test-Path $asmOut) -and ((Get-Item $asmOut).Length -gt 1KB)) {
+              $size = (Get-Item $asmOut).Length
+              Write-Host "✅ x86-64 .asm generated: $([math]::Round($size/1KB, 2)) KB"
+          } else {
+              Write-Host "⚠️ dumpbin output too small, retrying with /DISASM:NOBYTES..."
+              dumpbin /DISASM:NOBYTES "$($exePath.FullName)" 2>$null | Out-File -FilePath $asmOut -Encoding ascii
+              $size = (Get-Item $asmOut).Length
+              Write-Host "   Retry result: $([math]::Round($size/1KB, 2)) KB"
           }
-          Write-Host "UPX done"
 
-      - name: Show result and ZIP
+          # Если dumpbin не дал результата, создаём символический .asm
+          if (-not (Test-Path $asmOut) -or ((Get-Item $asmOut).Length -lt 100)) {
+              Write-Host "⚠️ dumpbin failed, generating synthetic .asm from symbol table..."
+              @"
+; ============================================================
+; Pure IPTV — x86-64 Disassembly (synthetic)
+; Source: $($exePath.Name)
+; Tool:   dumpbin /DISASM (symbols only)
+; ============================================================
+
+; Full disassembly was too large or unavailable.
+; Below is the symbol table summary:
+
+"@ | Out-File -FilePath $asmOut
+              dumpbin /SYMBOLS "$($exePath.FullName)" 2>$null >> $asmOut
+              dumpbin /EXPORTS "$($exePath.FullName)" 2>$null >> $asmOut
+          }
+
+      # ─────────────────────────────────────────────────────────────
+      # 5. СОБИРАЕМ ВСЁ В КУЧУ
+      # ─────────────────────────────────────────────────────────────
+      - name: "📊 STEP 5 — Manifest"
         shell: pwsh
         run: |
-          $after = (Get-ChildItem -Path $env:EXE_DIR -Recurse | Measure-Object -Property Length -Sum).Sum
-          $before = [double]$env:BEFORE
-          Write-Host "Before: $before MB"
-          Write-Host "After:  $([math]::Round($after/1MB, 1)) MB"
-          Write-Host "Saved:  $([math]::Round(($before-$after)/$before*100, 1))%"
-          Compress-Archive -Path "$env:EXE_DIR\*" -DestinationPath PureIPTV.zip
-          Write-Host "ZIP: $([math]::Round((Get-Item PureIPTV.zip).Length/1MB, 1)) MB"
+          Write-Host "`n📦 === BUILD MANIFEST ==="
+          $items = @(
+              @{Path = $env:EXE_PATH; Label = "EXE (Nuitka onefile)"},
+              @{Path = "PureIPTV_bytecode.asm"; Label = "Python bytecode .asm"},
+              @{Path = "PureIPTV_x86-64.asm"; Label = "x86-64 assembly .asm"}
+          )
+          $totalSize = 0
+          foreach ($item in $items) {
+              if (Test-Path $item.Path) {
+                  $size = (Get-Item $item.Path).Length
+                  $totalSize += $size
+                  Write-Host "   ✅ $($item.Label): $($item.Path) — $([math]::Round($size/1MB, 2)) MB"
+              } else {
+                  Write-Host "   ❌ $($item.Label): $($item.Path) — MISSING"
+              }
+          }
+          Write-Host "   ─────────────────────────"
+          Write-Host "   📦 Total: $([math]::Round($totalSize/1MB, 2)) MB`n"
 
-      - uses: actions/upload-artifact@v4
+      - name: "📦 STEP 6 — ZIP: .exe + .asm + assets"
+        shell: pwsh
+        run: |
+          $items = @()
+
+          # EXE
+          if (Test-Path $env:EXE_PATH) { $items += $env:EXE_PATH }
+
+          # .asm файлы
+          if (Test-Path "PureIPTV_bytecode.asm") { $items += "PureIPTV_bytecode.asm" }
+          if (Test-Path "PureIPTV_x86-64.asm") { $items += "PureIPTV_x86-64.asm" }
+
+          # Также ищем промежуточные .asm от MSVC /FA
+          $nuitkaAsms = Get-ChildItem -Path build -Recurse -Filter "*.asm" -ErrorAction SilentlyContinue
+          foreach ($asm in $nuitkaAsms) {
+              $items += $asm.FullName
+          }
+
+          $zipName = "PureIPTV-ASM-EXE.zip"
+          Compress-Archive -Path $items -DestinationPath $zipName -CompressionLevel Optimal
+
+          $size = (Get-Item $zipName).Length
+          Write-Host "✅ ZIP: $zipName  ($([math]::Round($size/1MB, 2)) MB)"
+
+      - name: "⬆️ Upload artifact"
+        uses: actions/upload-artifact@v4
         with:
-          name: PureIPTV
-          path: PureIPTV.zip
+          name: PureIPTV-ASM-EXE
+          path: PureIPTV-ASM-EXE.zip
