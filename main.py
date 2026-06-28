@@ -49,6 +49,9 @@ from datetime import datetime
 from xml.etree import ElementTree
 import time
 import traceback
+import shutil
+import random
+from collections import deque
 
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtQml import QQmlApplicationEngine
@@ -70,6 +73,14 @@ try:
     import requests
 except ImportError:
     raise SystemExit("❌ Модуль requests не установлен: pip install requests")
+
+# В прокси используется verify=False (игнор SSL у проблемных IPTV-серверов).
+# Без этого urllib3 на каждый запрос печатает InsecureRequestWarning и засоряет лог.
+try:
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+except Exception:
+    pass
 
 try:
     import mpv
@@ -138,6 +149,8 @@ QUALITY_HEIGHTS = {"ultra": 2160, "high": 1080, "medium": 720, "low": 480, "mini
 
 # Домены, требующие проксирования вложенных ресурсов (длинные токены → 414)
 PROXY_DOMAINS = ['televizor-24', 'streaming.', 'online-television']
+SEEN_MASTERS = set()
+MASTER_FETCHED = False
 
 
 # ============================================================
@@ -314,7 +327,13 @@ class HLSCache:
         cls._global_cache.clear()
 
     def _get_quality_variant(self, content, bandwidth):
-        """Выбирает вариант потока под выбранное качество / пропускную способность."""
+        """Выбирает вариант потока под выбранное качество / пропускную способность.
+        DISABLED for Xtream streams - they die on manifest re-requests.
+        We only use vf scaling instead."""
+        # Never rewrite Xtream master playlists - it causes -13 errors
+        if '/live/' in content or content.count('.m3u8') > 5:
+            return content
+            
         lines = content.split('\n')
         variants = []
 
@@ -391,27 +410,60 @@ class HLSCache:
         return '\n'.join(result_lines)
 
     def fetch_with_headers(self, url, referer=None):
+        ul = url.lower()
+        is_xtream_live = "/live/" in ul
+        is_xtream_vod = "/movie/" in ul or "/series/" in ul
+
         if url in HLSCache._global_cache:
             cached_content, cached_time, cached_is_master = HLSCache._global_cache[url]
-            ttl = 60 if cached_is_master else 3.5
+
+            # Smart TTL:
+            # - Xtream LIVE: only tiny TTL, otherwise live edge becomes stale and
+            #   the player keeps replaying old fragments on rejoin.
+            # - Xtream VOD/series: can be cached for a very long time (tokenized URLs).
+            # - Regular M3U: normal TTL.
+            if is_xtream_live:
+                ttl = 0.5 if cached_is_master else 0.5
+            elif is_xtream_vod:
+                ttl = 9999999999
+            else:
+                ttl = 60 if cached_is_master else 3.5
+
             if time.time() - cached_time < ttl:
                 return cached_content, None
 
         headers = BROWSER_HEADERS.copy()
+        # Always set proper headers for Xtream and IPTV
+        headers['User-Agent'] = BROWSER_HEADERS["User-Agent"]
+        headers['Accept'] = '*/*'
+        headers['Accept-Language'] = 'en-US,en;q=0.9'
+        headers['Connection'] = 'keep-alive'
+
+        # LIVE playlist must be revalidated every time, otherwise the player
+        # receives stale media-sequence / stale segments and "jumps back".
+        if is_xtream_live or ul.endswith('.m3u8'):
+            headers['Cache-Control'] = 'no-cache'
+            headers['Pragma'] = 'no-cache'
+
         if referer:
             headers['Referer'] = referer
-            parsed = urllib.parse.urlparse(referer)
-            headers['Origin'] = f"{parsed.scheme}://{parsed.netloc}"
         else:
             parsed = urllib.parse.urlparse(url)
             headers['Referer'] = f"{parsed.scheme}://{parsed.netloc}/"
-            headers['Origin'] = f"{parsed.scheme}://{parsed.netloc}"
 
         proxies = {'http': self.proxy_url, 'https': self.proxy_url} if self.proxy_url else None
 
         try:
-            response = http_session.get(url, headers=headers, timeout=20, proxies=proxies)
-            if response.status_code == 200:
+            # Make proxy very robust for problematic M3U streams
+            response = http_session.get(
+                url,
+                headers=headers,
+                timeout=25,
+                proxies=proxies,
+                verify=False,
+                allow_redirects=True
+            )
+            if response.status_code in (200, 301, 302):
                 content = response.content
                 try:
                     if response.headers.get('Content-Encoding') == 'gzip':
@@ -421,10 +473,12 @@ class HLSCache:
                 content = content.decode('utf-8', errors='ignore')
                 is_master = '#EXT-X-STREAM-INF' in content
 
-                if stream_optimizer.bandwidth > 0 or stream_optimizer.quality_level != "auto":
-                    content = self._get_quality_variant(content, stream_optimizer.bandwidth)
+                # Always apply quality when user selected a specific resolution
+                if stream_optimizer.quality_level != "auto":
+                    content = self._get_quality_variant(content, 0)  # force selection by quality_level
 
                 HLSCache._evict_if_needed()
+                # LIVE playlists must never be cached forever.
                 HLSCache._global_cache[url] = (content, time.time(), is_master)
                 return content, headers
         except Exception as e:
@@ -446,7 +500,9 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
-            if self.path.startswith('/hls/'):
+            if self.path.startswith('/livepipe/'):
+                original_url = urllib.parse.unquote(self.path[10:])
+            elif self.path.startswith('/hls/'):
                 original_url = urllib.parse.unquote(self.path[5:])
             elif self.path.startswith('/stream'):
                 params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
@@ -474,6 +530,10 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
                 else:
                     self.send_error(400)
                     return
+
+            if self.path.startswith('/livepipe/'):
+                self._handle_livepipe(original_url)
+                return
 
             lower = original_url.lower()
             if '.m3u8' in lower:
@@ -544,20 +604,25 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
                     lines.append(absolute)
 
         result = '\n'.join(lines)
+        # ВАЖНО: Content-Length должен быть в БАЙТАХ после UTF-8 кодирования,
+        # а не в символах. Иначе при наличии кириллицы/не-ASCII в манифесте
+        # длина окажется меньше реальной → MPV получит обрезанный плейлист.
+        result_bytes = result.encode('utf-8')
 
         self.send_response(200)
         self.send_header('Content-Type', 'application/vnd.apple.mpegurl')
-        self.send_header('Content-Length', len(result))
+        self.send_header('Content-Length', str(len(result_bytes)))
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'GET, OPTIONS')
         self.send_header('Access-Control-Allow-Headers', '*')
         self.end_headers()
-        self.wfile.write(result.encode('utf-8'))
+        self.wfile.write(result_bytes)
         print(f"✅ [HLS] Sent {len(lines)} lines")
 
     def _handle_segment(self, url):
         max_retries, retry_delay = 3, 1
         for attempt in range(max_retries):
+            response = None
             try:
                 seg_headers = BROWSER_HEADERS.copy()
                 parsed = urllib.parse.urlparse(url)
@@ -565,24 +630,53 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
                 seg_headers['Origin'] = f"{parsed.scheme}://{parsed.netloc}"
                 seg_headers['Accept-Encoding'] = 'identity'
 
-                proxies = {'http': self.proxy_url, 'https': self.proxy_url} if self.proxy_url else None
-                response = http_session.get(url, headers=seg_headers, timeout=30, stream=True, proxies=proxies)
+                # Для VOD/MP4 mpv часто читает через HTTP Range. Если не пробросить
+                # Range/If-Range к origin и не вернуть 206 + Content-Range назад,
+                # фильмы/сериалы ломаются или клиент сам абортит сокет (WinError 10053).
+                range_header = self.headers.get('Range')
+                if range_header:
+                    seg_headers['Range'] = range_header
+                if_range = self.headers.get('If-Range')
+                if if_range:
+                    seg_headers['If-Range'] = if_range
 
-                if response.status_code == 200:
-                    self.send_response(200)
+                proxies = {'http': self.proxy_url, 'https': self.proxy_url} if self.proxy_url else None
+                response = http_session.get(
+                    url,
+                    headers=seg_headers,
+                    timeout=30,
+                    stream=True,
+                    proxies=proxies,
+                    verify=False,
+                    allow_redirects=True,
+                )
+
+                if response.status_code in (200, 206):
+                    self.send_response(response.status_code)
+                    # Для .ts обычно Range не нужен, а для .mp4/VOD — критичен.
+                    # iter_content() при identity не трогает байты, поэтому можно
+                    # безопасно пробрасывать Content-Length/Content-Range от origin.
+                    excluded = {'transfer-encoding', 'connection'}
                     for key, value in response.headers.items():
-                        if key.lower() not in ['transfer-encoding', 'content-encoding', 'connection']:
+                        if key.lower() not in excluded:
                             self.send_header(key, value)
-                    self.send_header('Connection', 'keep-alive')
+                    if 'Accept-Ranges' not in response.headers:
+                        self.send_header('Accept-Ranges', 'bytes')
+                    self.send_header('Connection', 'close')
                     self.send_header('Access-Control-Allow-Origin', '*')
                     self.end_headers()
 
                     start_time = time.time()
                     bytes_downloaded = 0
-                    for chunk in response.iter_content(chunk_size=65536):
-                        if chunk:
-                            self.wfile.write(chunk)
-                            bytes_downloaded += len(chunk)
+                    try:
+                        for chunk in response.iter_content(chunk_size=65536):
+                            if chunk:
+                                self.wfile.write(chunk)
+                                bytes_downloaded += len(chunk)
+                    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                        # Клиент (mpv) мог закрыть текущее соединение и открыть новое
+                        # с другим Range — для VOD это нормальный сценарий.
+                        return
 
                     duration = time.time() - start_time
                     if duration > 0.05 and bytes_downloaded > 1024:
@@ -597,7 +691,7 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
                             except Exception:
                                 pass
                     return
-                elif response.status_code in [403, 404]:
+                elif response.status_code in [403, 404, 416]:
                     print(f"⚠️ [HLS] Segment {response.status_code}, retry {attempt + 1}/{max_retries}")
                     if attempt < max_retries - 1:
                         time.sleep(retry_delay)
@@ -607,25 +701,602 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
                 if attempt < max_retries - 1:
                     time.sleep(retry_delay)
                     continue
+            finally:
+                try:
+                    if response is not None:
+                        response.close()
+                except Exception:
+                    pass
 
         try:
             self.send_error(500)
         except Exception:
             pass
 
-    def _handle_generic(self, url):
+    def _handle_livepipe(self, url):
         try:
-            proxies = {'http': self.proxy_url, 'https': self.proxy_url} if self.proxy_url else None
-            response = http_session.get(url, headers=BROWSER_HEADERS, timeout=30, proxies=proxies)
-            self.send_response(response.status_code)
-            for key, value in response.headers.items():
-                if key.lower() not in ['transfer-encoding', 'content-encoding']:
-                    self.send_header(key, value)
+            # Pure-Python LIVEPIPE без ffmpeg.
+            # Для Xtream-потоков используем прямой .ts fallback, если HLS auth/token
+            # слишком быстро протухает. Xtream API/live credentials обычно стабильнее,
+            # чем краткоживущие segment URLs внутри auth m3u8.
+            live_match = re.search(r'/live/([^/]+)/([^/]+)/([^/.?]+)\.m3u8(?:$|[?])', url, re.IGNORECASE)
+            if live_match:
+                user = urllib.parse.unquote(live_match.group(1))
+                pwd = urllib.parse.unquote(live_match.group(2))
+                stream_id = urllib.parse.unquote(live_match.group(3))
+                parsed_src = urllib.parse.urlparse(url)
+                direct_ts_url = f"{parsed_src.scheme}://{parsed_src.netloc}/live/{user}/{pwd}/{stream_id}.ts"
+            else:
+                direct_ts_url = None
+
+            self.send_response(200)
+            self.send_header('Content-Type', 'video/mp2t')
+            self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
+            self.send_header('Pragma', 'no-cache')
+            self.send_header('Connection', 'close')
+            self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
-            self.wfile.write(response.content)
+
+            parsed_source = urllib.parse.urlparse(url)
+            origin_referer = f"{parsed_source.scheme}://{parsed_source.netloc}/"
+
+            def _playlist_headers(current_url):
+                h = BROWSER_HEADERS.copy()
+                p = urllib.parse.urlparse(current_url)
+                h['Accept'] = '*/*'
+                h['Accept-Encoding'] = 'identity'
+                h['Cache-Control'] = 'no-cache'
+                h['Pragma'] = 'no-cache'
+                h['Referer'] = f"{p.scheme}://{p.netloc}/"
+                h['Connection'] = 'keep-alive'
+                return h
+
+            def _segment_headers(seg_url):
+                h = BROWSER_HEADERS.copy()
+                p = urllib.parse.urlparse(seg_url)
+                h['Accept'] = '*/*'
+                h['Accept-Encoding'] = 'identity'
+                h['Cache-Control'] = 'no-cache'
+                h['Pragma'] = 'no-cache'
+                h['Referer'] = f"{p.scheme}://{p.netloc}/"
+                h['Origin'] = f"{p.scheme}://{p.netloc}"
+                h['Connection'] = 'keep-alive'
+                return h
+
+            def _parse_retry_after(resp, default_wait):
+                """Читает Retry-After (секунды или HTTP-date). Возвращает секунды для sleep."""
+                ra = None
+                try:
+                    ra = resp.headers.get('Retry-After')
+                except Exception:
+                    ra = None
+                if not ra:
+                    return default_wait
+                try:
+                    return max(0.5, float(int(ra)))
+                except Exception:
+                    pass
+                try:
+                    from email.utils import parsedate_to_datetime
+                    import datetime as _dt
+                    when = parsedate_to_datetime(ra)
+                    if when is not None:
+                        delta = (when - _dt.datetime.now(when.tzinfo)).total_seconds()
+                        return max(0.5, min(30.0, delta))
+                except Exception:
+                    pass
+                return default_wait
+
+            def _fetch_text(current_url, timeout=20):
+                r = http_session.get(
+                    current_url,
+                    headers=_playlist_headers(current_url),
+                    timeout=timeout,
+                    verify=False,
+                    allow_redirects=True,
+                )
+                try:
+                    if r.status_code == 429:
+                        # Сервер просит притормозить. НЕ роняем поток — отдаём backoff наверх.
+                        wait = _parse_retry_after(r, 3.0)
+                        err = RuntimeError('playlist HTTP 429')
+                        err.retry_after = wait
+                        err.is_429 = True
+                        raise err
+                    if r.status_code != 200:
+                        raise RuntimeError(f'playlist HTTP {r.status_code}')
+                    return r.text, r.url
+                finally:
+                    try:
+                        r.close()
+                    except Exception:
+                        pass
+
+            def _parse_attr_list(s):
+                attrs = {}
+                for m in re.finditer(r'([A-Z0-9-]+)=((?:"[^"]*")|[^,]*)', s):
+                    key = m.group(1)
+                    val = m.group(2).strip()
+                    if len(val) >= 2 and val[0] == '"' and val[-1] == '"':
+                        val = val[1:-1]
+                    attrs[key] = val
+                return attrs
+
+            def _pick_variant(master_text, master_url):
+                lines = [ln.strip() for ln in master_text.splitlines()]
+                base_url = master_url.rsplit('/', 1)[0] + '/'
+                variants = []
+                audio_uri = None
+                for ln in lines:
+                    if ln.startswith('#EXT-X-MEDIA:'):
+                        attrs = _parse_attr_list(ln.split(':', 1)[1])
+                        if attrs.get('TYPE') == 'AUDIO' and attrs.get('DEFAULT', '').upper() == 'YES' and attrs.get('URI'):
+                            audio_uri = make_absolute(attrs['URI'], base_url, master_url)
+                i = 0
+                while i < len(lines):
+                    ln = lines[i]
+                    if ln.startswith('#EXT-X-STREAM-INF:'):
+                        attrs = _parse_attr_list(ln.split(':', 1)[1])
+                        uri = ''
+                        j = i + 1
+                        while j < len(lines):
+                            cand = lines[j]
+                            if cand and not cand.startswith('#'):
+                                uri = make_absolute(cand, base_url, master_url)
+                                break
+                            j += 1
+                        if uri:
+                            bw = 0
+                            try:
+                                bw = int(attrs.get('BANDWIDTH', '0') or '0')
+                            except Exception:
+                                bw = 0
+                            variants.append({
+                                'url': uri,
+                                'bandwidth': bw,
+                                'audio': attrs.get('AUDIO'),
+                                'resolution': attrs.get('RESOLUTION', ''),
+                            })
+                    i += 1
+                if not variants:
+                    return master_url, audio_uri
+                variants.sort(key=lambda x: x['bandwidth'])
+                chosen = variants[-1]
+                print(f"📡 [LIVEPIPE] master variant selected: {chosen['resolution'] or 'unknown'} / {chosen['bandwidth']}bps")
+                return chosen['url'], audio_uri
+
+            def _parse_media_playlist(media_text, media_url):
+                lines = [ln.strip() for ln in media_text.splitlines()]
+                base_url = media_url.rsplit('/', 1)[0] + '/'
+                media_sequence = 0
+                target_duration = 2.0
+                endlist = False
+                init_map = None
+                segments = []
+                pending_duration = None
+                current_seq = None
+                discontinuity_next = False
+                for ln in lines:
+                    if not ln:
+                        continue
+                    if ln.startswith('#EXT-X-MEDIA-SEQUENCE:'):
+                        try:
+                            media_sequence = int(ln.split(':', 1)[1].strip())
+                        except Exception:
+                            media_sequence = 0
+                        current_seq = media_sequence
+                        continue
+                    if ln.startswith('#EXT-X-TARGETDURATION:'):
+                        try:
+                            target_duration = max(1.0, float(ln.split(':', 1)[1].strip()))
+                        except Exception:
+                            target_duration = 2.0
+                        continue
+                    if ln.startswith('#EXT-X-MAP:'):
+                        attrs = _parse_attr_list(ln.split(':', 1)[1])
+                        map_uri = attrs.get('URI')
+                        if map_uri:
+                            init_map = make_absolute(map_uri, base_url, media_url)
+                        continue
+                    if ln.startswith('#EXTINF:'):
+                        try:
+                            pending_duration = float(ln.split(':', 1)[1].split(',', 1)[0].strip())
+                        except Exception:
+                            pending_duration = None
+                        continue
+                    if ln.startswith('#EXT-X-DISCONTINUITY'):
+                        discontinuity_next = True
+                        continue
+                    if ln.startswith('#EXT-X-ENDLIST'):
+                        endlist = True
+                        continue
+                    if ln.startswith('#'):
+                        continue
+                    abs_url = make_absolute(ln, base_url, media_url)
+                    seq_value = current_seq if current_seq is not None else media_sequence + len(segments)
+                    segments.append({
+                        'seq': seq_value,
+                        'url': abs_url,
+                        'duration': pending_duration,
+                        'discontinuity': discontinuity_next,
+                    })
+                    if current_seq is not None:
+                        current_seq += 1
+                    pending_duration = None
+                    discontinuity_next = False
+                return {
+                    'media_sequence': media_sequence,
+                    'target_duration': target_duration,
+                    'segments': segments,
+                    'endlist': endlist,
+                    'init_map': init_map,
+                }
+
+            current_playlist_url = url
+            media_playlist_url = url
+            selected_audio_playlist = None
+            refresh_from_source_url = url
+            last_seq = None
+            hard_fail_count = 0
+
+            def _stream_direct_ts(ts_url):
+                print(f"📡 [LIVEPIPE] switching to direct TS: {ts_url[:120]}")
+                reconnect_count = 0
+                # Остаток байт, не выровненный по 188-байтной границе TS-пакета.
+                # MPEG-TS состоит строго из пакетов по 188 байт; если отдать mpv
+                # «обрезанный» пакет, ломаются DTS/PTS и копится AV-desync.
+                # Поэтому всегда отдаём ТОЛЬКО целые TS-пакеты, остаток переносим.
+                carry = b''
+
+                while True:
+                    resp = None
+                    bytes_written = 0
+                    try:
+                        resp = http_session.get(
+                            ts_url,
+                            headers=_segment_headers(ts_url),
+                            timeout=(15, 120),
+                            stream=True,
+                            verify=False,
+                            allow_redirects=True,
+                        )
+                        if resp.status_code == 429:
+                            wait = _parse_retry_after(resp, 3.0)
+                            wait = min(30.0, wait + random.uniform(0, 1.5))
+                            print(f"⏳ [LIVEPIPE] direct TS 429; cooling down {wait:.1f}s")
+                            time.sleep(wait)
+                            continue
+                        if resp.status_code != 200:
+                            raise RuntimeError(f'direct TS HTTP {resp.status_code}')
+                        reconnect_count = 0
+                        for chunk in resp.iter_content(chunk_size=65536):
+                            if not chunk:
+                                continue
+
+                            # Дописываем к перенесённому остатку и режем по 188 байт.
+                            buf = carry + chunk
+                            n = len(buf)
+                            aligned = n - (n % 188)
+                            out = buf[:aligned]
+                            carry = buf[aligned:]
+                            if not out:
+                                continue
+
+                            # БЕЗ байтового dedup'а хвоста — он рвал TS-выравнивание
+                            # и сам провоцировал desync. На стыке reopen mpv сам
+                            # разрулит дубли/разрыв через fflags=+genpts+igndts+discardcorrupt.
+                            try:
+                                self.wfile.write(out)
+                                self.wfile.flush()
+                            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                                return
+                            bytes_written += len(out)
+
+                        # Если сервер закрыл сокет после куска live TS — просто
+                        # открываем тот же URL заново, а не считаем это концом live.
+                        if bytes_written > 0:
+                            time.sleep(0.1)
+                            continue
+                        raise RuntimeError('direct TS ended without payload')
+                    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                        return
+                    except Exception as e:
+                        reconnect_count += 1
+                        wait_s = min(2.0, 0.25 * reconnect_count)
+                        print(f"⚠️ [LIVEPIPE] direct TS reconnect {reconnect_count}: {e}")
+                        time.sleep(wait_s)
+                        continue
+                    finally:
+                        try:
+                            if resp is not None:
+                                resp.close()
+                        except Exception:
+                            pass
+            last_playlist_fingerprint = None
+            last_changed_at = time.time()
+            sent_recent = deque(maxlen=4096)
+            sent_recent_set = set()
+            last_init_map = None
+            consecutive_playlist_errors = 0
+            consecutive_429 = 0
+
+            # Первичный fetch тоже должен переживать 429 (а не падать в 500),
+            # иначе mpv сразу получит EOF и устроит reopen.
+            initial_text = resolved_initial_url = None
+            for _attempt in range(8):
+                try:
+                    initial_text, resolved_initial_url = _fetch_text(current_playlist_url, timeout=25)
+                    break
+                except Exception as ie:
+                    if getattr(ie, 'is_429', False):
+                        wait = min(30.0, (getattr(ie, 'retry_after', 3.0) or 3.0)
+                                   * (1.5 ** _attempt)) + random.uniform(0, 1.5)
+                        print(f"⏳ [LIVEPIPE] initial 429; cooling down {wait:.1f}s")
+                        time.sleep(wait)
+                        continue
+                    raise
+            if initial_text is None:
+                # 429 не отпустил за разумное время — пробуем direct TS, если есть.
+                if direct_ts_url:
+                    _stream_direct_ts(direct_ts_url)
+                    return
+                raise RuntimeError('initial playlist unavailable (429)')
+            current_playlist_url = resolved_initial_url
+            media_playlist_url = resolved_initial_url
+            if '#EXT-X-STREAM-INF' in initial_text:
+                media_playlist_url, selected_audio_playlist = _pick_variant(initial_text, resolved_initial_url)
+                print(f"📡 [LIVEPIPE] using media playlist: {media_playlist_url[:120]}")
+            elif '#EXTM3U' not in initial_text:
+                raise RuntimeError('not a valid HLS playlist')
+
+            while True:
+                loop_started = time.time()
+                try:
+                    text, resolved_media_url = _fetch_text(media_playlist_url, timeout=12)
+                    media_playlist_url = resolved_media_url
+                    consecutive_playlist_errors = 0
+                    consecutive_429 = 0
+                except Exception as e:
+                    # 429 Too Many Requests — это НЕ повод рвать поток или переключаться
+                    # на direct TS / source refresh. Сервер просто просит притормозить.
+                    # Уважаем Retry-After + экспоненциальный backoff с jitter и продолжаем
+                    # тот же media playlist. Главное — НЕ закрывать соединение к mpv,
+                    # иначе mpv поймает EOF и устроит reopen storm, усиливающий 429.
+                    if getattr(e, 'is_429', False):
+                        consecutive_429 += 1
+                        base = getattr(e, 'retry_after', 3.0) or 3.0
+                        backoff = min(30.0, base * (1.5 ** min(consecutive_429 - 1, 5)))
+                        jitter = random.uniform(0, min(2.0, backoff * 0.3))
+                        wait_s = backoff + jitter
+                        print(f"⏳ [LIVEPIPE] 429 Too Many Requests (#{consecutive_429}); cooling down {wait_s:.1f}s")
+                        time.sleep(wait_s)
+                        continue
+
+                    consecutive_429 = 0
+                    consecutive_playlist_errors += 1
+                    wait_s = min(5.0, 0.75 * consecutive_playlist_errors)
+                    print(f"⚠️ [LIVEPIPE] playlist reload failed ({consecutive_playlist_errors}): {e}; retry in {wait_s:.1f}s")
+
+                    # У части IPTV/Xtream origin'ов media-playlist URL и segment token
+                    # протухают очень быстро. Если media playlist начал отдавать 404,
+                    # надо снова сходить на исходный live URL и получить новый auth m3u8.
+                    if ('404' in str(e) or '403' in str(e)) and refresh_from_source_url:
+                        try:
+                            root_text, root_resolved_url = _fetch_text(refresh_from_source_url, timeout=20)
+                            refresh_from_source_url = root_resolved_url
+                            if '#EXT-X-STREAM-INF' in root_text:
+                                new_media_url, selected_audio_playlist = _pick_variant(root_text, root_resolved_url)
+                            else:
+                                new_media_url = root_resolved_url
+                            if new_media_url != media_playlist_url:
+                                print(f"🔄 [LIVEPIPE] refreshed media playlist URL")
+                            media_playlist_url = new_media_url
+                            hard_fail_count = 0
+                            time.sleep(0.2)
+                            continue
+                        except Exception as refresh_err:
+                            print(f"⚠️ [LIVEPIPE] source refresh failed: {refresh_err}")
+                            hard_fail_count += 1
+                            if direct_ts_url and hard_fail_count >= 2:
+                                _stream_direct_ts(direct_ts_url)
+                                return
+
+                    if direct_ts_url and consecutive_playlist_errors >= 8:
+                        _stream_direct_ts(direct_ts_url)
+                        return
+
+                    time.sleep(wait_s)
+                    continue
+
+                # Некоторые origin'ы внезапно возвращают master и на media URL.
+                if '#EXT-X-STREAM-INF' in text:
+                    media_playlist_url, selected_audio_playlist = _pick_variant(text, media_playlist_url)
+                    time.sleep(0.2)
+                    continue
+
+                playlist = _parse_media_playlist(text, media_playlist_url)
+                segments = playlist['segments']
+                target_duration = max(1.0, float(playlist['target_duration']))
+                fingerprint = (playlist['media_sequence'], tuple(seg['url'] for seg in segments[-6:]))
+
+                if playlist['init_map'] and playlist['init_map'] != last_init_map:
+                    try:
+                        init_resp = http_session.get(
+                            playlist['init_map'],
+                            headers=_segment_headers(playlist['init_map']),
+                            timeout=20,
+                            stream=True,
+                            verify=False,
+                            allow_redirects=True,
+                        )
+                        if init_resp.status_code == 200:
+                            try:
+                                for chunk in init_resp.iter_content(chunk_size=65536):
+                                    if chunk:
+                                        self.wfile.write(chunk)
+                            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                                return
+                            last_init_map = playlist['init_map']
+                            print('📦 [LIVEPIPE] sent init segment')
+                    finally:
+                        try:
+                            init_resp.close()
+                        except Exception:
+                            pass
+
+                if not segments:
+                    sleep_for = max(0.5, min(3.0, target_duration * 0.5))
+                    time.sleep(sleep_for)
+                    continue
+
+                newest_seq = segments[-1]['seq']
+                oldest_seq = segments[0]['seq']
+
+                if last_seq is None:
+                    # Стартуем не в самом хвосте, а с небольшим запасом, чтобы не словить underrun.
+                    hold_back = max(2, min(4, len(segments) - 1))
+                    start_seq = max(oldest_seq, newest_seq - hold_back)
+                else:
+                    # Если live window уже убежало вперёд, мягко перескакиваем к актуальному окну.
+                    if last_seq < oldest_seq - 1:
+                        print(f"⚠️ [LIVEPIPE] live window advanced: last_seq={last_seq}, oldest={oldest_seq}; jump to live edge")
+                        start_seq = max(oldest_seq, newest_seq - 2)
+                    else:
+                        start_seq = last_seq + 1
+
+                sent_now = 0
+                for seg in segments:
+                    seg_seq = seg['seq']
+                    seg_url = seg['url']
+                    if seg_seq < start_seq:
+                        continue
+                    if seg_seq <= (last_seq if last_seq is not None else -1):
+                        continue
+                    if seg_url in sent_recent_set and seg_seq <= newest_seq:
+                        continue
+
+                    seg_resp = None
+                    try:
+                        seg_resp = http_session.get(
+                            seg_url,
+                            headers=_segment_headers(seg_url),
+                            timeout=20,
+                            stream=True,
+                            verify=False,
+                            allow_redirects=True,
+                        )
+                        if seg_resp.status_code == 429:
+                            wait = _parse_retry_after(seg_resp, 2.0)
+                            print(f"⏳ [LIVEPIPE] segment 429; cooling down {wait:.1f}s")
+                            time.sleep(wait)
+                            # Не двигаем last_seq — попробуем этот же сегмент на следующем
+                            # проходе после паузы. Поток к mpv не рвём.
+                            break
+                        if seg_resp.status_code != 200:
+                            print(f"⚠️ [LIVEPIPE] segment HTTP {seg_resp.status_code}: {seg_url[:120]}")
+                            if seg_resp.status_code in (403, 404):
+                                # Токен/окно сегмента успело протухнуть — форсируем немедленный
+                                # refresh playlist, а не пытаемся доедать уже мёртвые URI.
+                                break
+                            continue
+                        for chunk in seg_resp.iter_content(chunk_size=65536):
+                            if chunk:
+                                self.wfile.write(chunk)
+                    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                        return
+                    except Exception as e:
+                        print(f"⚠️ [LIVEPIPE] segment fetch failed seq={seg_seq}: {e}")
+                        continue
+                    finally:
+                        try:
+                            if seg_resp is not None:
+                                seg_resp.close()
+                        except Exception:
+                            pass
+
+                    if len(sent_recent) == sent_recent.maxlen:
+                        old = sent_recent.popleft()
+                        sent_recent_set.discard(old)
+                    sent_recent.append(seg_url)
+                    sent_recent_set.add(seg_url)
+                    last_seq = seg_seq
+                    sent_now += 1
+
+                playlist_changed = fingerprint != last_playlist_fingerprint
+                if playlist_changed or sent_now > 0:
+                    last_changed_at = time.time()
+                last_playlist_fingerprint = fingerprint
+
+                if sent_now > 0:
+                    # После успешной отдачи сегментов перезагружаем playlist по RFC:
+                    # changed playlist => wait at least target duration from load start.
+                    elapsed = time.time() - loop_started
+                    sleep_for = max(0.2, min(3.0, target_duration - elapsed))
+                else:
+                    # unchanged playlist => half target duration.
+                    elapsed = time.time() - loop_started
+                    sleep_for = max(0.35, min(3.0, target_duration * 0.5 - elapsed))
+
+                if time.time() - last_changed_at > max(30.0, target_duration * 6):
+                    print('⚠️ [LIVEPIPE] playlist stalled for a long time, waiting for fresh segments...')
+                    last_changed_at = time.time()
+
+                time.sleep(sleep_for)
+        except Exception as e:
+            print(f"❌ [LIVEPIPE] error: {e}")
+            try:
+                self.send_error(500)
+            except Exception:
+                pass
+
+    def _handle_generic(self, url):
+        response = None
+        try:
+            headers = BROWSER_HEADERS.copy()
+            headers['Accept-Encoding'] = 'identity'
+            range_header = self.headers.get('Range')
+            if range_header:
+                headers['Range'] = range_header
+            if_range = self.headers.get('If-Range')
+            if if_range:
+                headers['If-Range'] = if_range
+
+            proxies = {'http': self.proxy_url, 'https': self.proxy_url} if self.proxy_url else None
+            response = http_session.get(
+                url,
+                headers=headers,
+                timeout=30,
+                proxies=proxies,
+                stream=True,
+                verify=False,
+                allow_redirects=True,
+            )
+            body = response.content
+            self.send_response(response.status_code)
+            # Generic/VOD ответы тоже могут приходить по Range (206).
+            # Отдаём клиенту Content-Range/Content-Length как есть, потому что
+            # запросили identity и body соответствует байтам origin.
+            for key, value in response.headers.items():
+                if key.lower() not in ['transfer-encoding', 'connection']:
+                    self.send_header(key, value)
+            if 'Accept-Ranges' not in response.headers:
+                self.send_header('Accept-Ranges', 'bytes')
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Connection', 'close')
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                return
         except Exception:
             try:
                 self.send_error(500)
+            except Exception:
+                pass
+        finally:
+            try:
+                if response is not None:
+                    response.close()
             except Exception:
                 pass
 
@@ -655,6 +1326,37 @@ class HLSProxyServer(ThreadingMixIn, HTTPServer):
 
 
 _hls_server = None
+_live_ffmpeg_processes = {}
+_live_ffmpeg_lock = threading.Lock()
+_livepipe_state = {}
+_livepipe_state_lock = threading.Lock()
+
+
+def find_ffmpeg_executable():
+    candidates = []
+    if sys.platform == 'win32':
+        candidates.extend([
+            os.path.join(script_dir, 'ffmpeg.exe'),
+            os.path.join(script_dir, 'ffmpeg', 'ffmpeg.exe'),
+            os.path.join(script_dir, 'FFmpeg', 'ffmpeg.exe'),
+            os.path.join(script_dir, 'FFMPEG', 'ffmpeg.exe'),
+            os.path.join(script_dir, 'MPV', 'ffmpeg.exe'),
+            os.path.join(script_dir, 'mpv', 'ffmpeg.exe'),
+        ])
+    else:
+        candidates.extend([
+            os.path.join(script_dir, 'ffmpeg'),
+            os.path.join(script_dir, 'ffmpeg', 'ffmpeg'),
+        ])
+
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+
+    found = shutil.which('ffmpeg')
+    if found:
+        return found
+    return None
 
 
 def start_hls_proxy(proxy_url=None, port=8899, core=None):
@@ -1048,9 +1750,26 @@ class IPTVCore(QObject):
     bufferingProgressChanged = Signal()
     segmentDownloaded = Signal(float)
     availableQualitiesChanged = Signal()
+    countryChanged = Signal()
     bandwidthSaverChanged = Signal()
     contentModeChanged = Signal()
     seriesInfoReady = Signal(str)
+    requestLiveRejoin = Signal(str)
+    requestReconnect = Signal()
+    # Универсальный канал: выполнить произвольный callable на GUI-thread.
+    # Любой mpv observer/callback thread эмитит этот сигнал, а слот (живущий на
+    # GUI thread) вызывает callable. Это исключает QTimer.singleShot из не-GUI
+    # потоков, который и давал "event dispatcher has already been destroyed".
+    runOnGui = Signal(object)
+
+    # Все сигналы объявлены выше — затем атрибуты/свойства.
+    # (Раньше эти три сигнала стояли ПОСЛЕ @Property, что мешало читаемости
+    #  и легко приводило к ошибкам при рефакторинге.)
+    _available_qualities = ["auto", "ultra", "high", "medium", "low", "minimal"]
+
+    @Property('QVariantList', notify=availableQualitiesChanged)
+    def availableQualities(self):
+        return self._available_qualities
 
     def __init__(self, engine):
         super().__init__()
@@ -1064,6 +1783,7 @@ class IPTVCore(QObject):
         self._last_url = ""
         self._last_channel_name = ""
         self._last_category = ""
+        self._last_start_raw = ""
         self._target_code = "ALL"
         self._target_name = "Глобальный"
         self._em = EPGModel()
@@ -1071,12 +1791,19 @@ class IPTVCore(QObject):
         self._init = False
         self.w = None
         self._retry_count = 0
+        self._quality_changing = False
         self._is_buffering = False
         self._buffering_progress = 100
         self._connection_quality = "unknown"
         self._current_quality = "auto"
         self._available_qualities = ["auto", "ultra", "high", "medium", "low", "minimal"]
         self._qualities_analyzed = False
+        self._live_rejoin_pending = False
+        # Защита от reopen storm на нестабильном LIVE: не переоткрываем чаще,
+        # чем раз в N секунд, и считаем подряд идущие EOF.
+        self._last_live_reopen_at = 0.0
+        self._live_reopen_count = 0
+        self._last_avsync_log = 0.0
 
         # === КОНТЕНТ-МОДЕЛИ: каналы / фильмы / сериалы ===
         self._movies = []
@@ -1101,6 +1828,11 @@ class IPTVCore(QObject):
 
         # thread-safe сигнал уровня соединения
         self.segmentDownloaded.connect(self.update_connection_quality_from_speed)
+        self.requestLiveRejoin.connect(self._perform_live_rejoin)
+        self.requestReconnect.connect(self._do_reconnect)
+        # AutoConnection => при эмите из чужого потока вызов уйдёт в очередь
+        # GUI-треда и выполнится там. Это безопасное место для QTimer и пр.
+        self.runOnGui.connect(self._run_on_gui)
 
         if HAS_MPV:
             self._init_mpv()
@@ -1111,10 +1843,19 @@ class IPTVCore(QObject):
     def _init_mpv(self):
         try:
             self.player = mpv.MPV(
-                vo='gpu', hwdec='auto-copy', ytdl=False, osc=False,
+                vo='gpu', hwdec='auto-safe', ytdl=False, osc=False,
                 input_default_bindings=False, input_vo_keyboard=True,
 
                 keep_open='yes', keep_open_pause='no', hr_seek='yes',
+                profile='low-latency',
+                # ВАЖНО: untimed='yes' раньше ломал live A/V — он велит mpv
+                # игнорировать тайминги и гнать кадры как можно быстрее, из-за чего
+                # на сыром TS desync рос линейно (видно по логам 2.0→3.0→4.0→5.0с).
+                # Для muxed live это недопустимо, поэтому untimed выключен.
+                untimed='no',
+                audio_buffer='0.2',
+                video_sync='audio',
+                audio_samplerate='48000',
                 network_timeout=CacheConfig.NETWORK_TIMEOUT,
 
                 # === СТРОГИЙ ЛИМИТ КЭША (ТЗ: 200 МБ / 60 секунд) ===
@@ -1127,9 +1868,30 @@ class IPTVCore(QObject):
                 demuxer_readahead_secs=CacheConfig.READAHEAD_SECS,
                 demuxer_hysteresis_secs=CacheConfig.HYSTERESIS_SECS,
 
-                # Устойчивость к сети / live
-                demuxer_lavf_o='reconnect=1,reconnect_streamed=1,reconnect_delay_max=3,bufsize=64KiB',
+                # Устойчивость к сети / live.
+                # Для HLS/live критично не слишком рано сдаваться на reload'ах m3u8,
+                # иначе mpv доходит до края live window и делает заметный reopen.
+                demuxer_lavf_o=(
+                    'reconnect=1,'
+                    'reconnect_streamed=1,'
+                    'reconnect_delay_max=2,'
+                    'max_reload=1000000,'
+                    'm3u8_hold_counters=1000000,'
+                    'seg_max_retry=3,'
+                    'http_persistent=1,'
+                    'http_seekable=0,'
+                    # fflags=+genpts чинит «non-monotonous DTS» на сырых склеенных
+                    # TS из Xtream direct .ts: mpv перегенерирует таймстампы вместо
+                    # того чтобы копить AV-desync. discardcorrupt отбрасывает битые
+                    # пакеты на стыках reopen, а не тянет их в декодер.
+                    # (igndts намеренно НЕ включаем глобально — он может слегка
+                    #  влиять на seek у нормального VOD .mp4.)
+                    'fflags=+genpts+discardcorrupt,'
+                    'bufsize=64KiB'
+                ),
                 force_seekable='yes',
+                vd_lavc_threads='2',
+                ad_lavc_threads='1',
                 # hls-bitrate / audio / subs — НЕ задаём здесь: управляются через setQuality и меню.
             )
             self.player['user-agent'] = BROWSER_HEADERS['User-Agent']
@@ -1157,7 +1919,8 @@ class IPTVCore(QObject):
                     self._set_connection_quality("excellent")
                 if not self._qualities_analyzed:
                     self._qualities_analyzed = True
-                    QTimer.singleShot(0, self._update_available_qualities_from_tracks)
+                    # Реальная работа на GUI-thread (НЕ QTimer.singleShot из mpv-потока).
+                    self._gui_call(self._update_available_qualities_from_tracks)
 
         @p.property_observer('duration')
         def on_dur(_n, v):
@@ -1174,8 +1937,19 @@ class IPTVCore(QObject):
 
         @p.property_observer('avsync')
         def on_avsync(_n, v):
-            if v is not None and abs(v) > 1.0:
-                print(f"⚠️ AV desync detected: {v}")
+            # НЕ делаем reopen по AV desync (это вызывало churn/429).
+            # Теперь desync лечится на уровне demuxer (genpts/igndts) + untimed=no,
+            # поэтому он не должен копиться. Логируем максимум раз в 5с, чтобы не
+            # засорять консоль сотнями строк, как было раньше.
+            if v is None:
+                return
+            av = abs(v)
+            if av <= 1.5:
+                return
+            now = time.time()
+            if now - getattr(self, '_last_avsync_log', 0.0) >= 5.0:
+                self._last_avsync_log = now
+                print(f"⚠️ AV desync: {v:.2f}s (demuxer genpts/igndts сглаживает)")
 
         try:
             @p.property_observer('paused-for-cache')
@@ -1184,11 +1958,16 @@ class IPTVCore(QObject):
                 self.bufferingChanged.emit()
                 if self._is_buffering:
                     self._set_status("Буферизация...")
+                    # ВАЖНО: для LIVE НЕ делаем принудительный reopen по обычной
+                    # paused-for-cache. Пользователь хочет полностью плавное продолжение
+                    # без заметной перезагрузки URL. Пусть ffmpeg/mpv сам дождётся
+                    # новых сегментов через max_reload + m3u8_hold_counters.
                     # Не ставим poor при кратковременной буферизации —
                     # подождём, видео может продолжиться через секунду.
                     # Quality останется как было (good/excellent от time-pos).
                 else:
                     self._retry_count = 0
+                    self._live_rejoin_pending = False
                     self._set_status("Воспроизведение...")
                     self._set_connection_quality("excellent")
         except Exception as e:
@@ -1206,7 +1985,7 @@ class IPTVCore(QObject):
             @p.property_observer('video-params')
             def on_video_params(_n, v):
                 if v:
-                    QTimer.singleShot(0, self._update_available_qualities_from_tracks)
+                    self._gui_call(self._update_available_qualities_from_tracks)
         except Exception as e:
             print(f"⚠️ Failed to observe video-params: {e}")
 
@@ -1217,7 +1996,7 @@ class IPTVCore(QObject):
                     reason = event.data.reason
                     err = event.data.error
                     print(f"🎬 end-file: reason={reason}, error={err}")
-                    if reason == 0:
+                    if reason in (0, 2):
                         self._handle_playback_end()
                     elif reason == 4:
                         self._handle_playback_error(err)
@@ -1260,29 +2039,96 @@ class IPTVCore(QObject):
             print(f"[Player] Reconnecting in {delay}s... (attempt {self._retry_count}/5)")
             self._set_status(f"Переподключение (попытка {self._retry_count}/5 через {delay}с)...")
             self._set_connection_quality("poor")
-            QTimer.singleShot(delay * 1000, self._do_reconnect)
+            if QGuiApplication.instance():
+                # QTimer должен создаваться на GUI-thread. Планируем создание таймера
+                # через runOnGui, иначе при вызове из mpv-потока получим
+                # "event dispatcher has already been destroyed".
+                d = delay
+                self._gui_call(lambda: QTimer.singleShot(d * 1000, lambda: self.requestReconnect.emit()))
         else:
             print("❌ Reconnect failed: max attempts reached.")
             self._set_status("Ошибка: потеряно соединение")
             self._retry_count = 0
 
+    def _is_live_stream(self, url, start_raw=""):
+        ul = (url or "").lower()
+        if start_raw:
+            return False
+        if "/live/" in ul:
+            return True
+        if "/movie/" in ul or "/series/" in ul:
+            return False
+        return '.m3u8' in ul
+
     def _needs_proxy(self, url):
         ul = url.lower()
-        return any(d in ul for d in PROXY_DOMAINS) or 'iframe' in ul
+        # Xtream streams REQUIRE the proxy
+        if "/live/" in ul or "/movie/" in ul or "/series/" in ul:
+            return True
+        # Regular M3U/M3U8 → NEVER through proxy
+        return False
 
     def _play_url(self, url):
-        """Проигрывает URL через прямой доступ или прокси — единая точка запуска."""
+        """Xtream → proxy, Regular M3U → direct (most reliable)"""
         if self._needs_proxy(url):
             start_hls_proxy(None, core=self)
-            self.player.play(get_proxied_url(url))
-            print(f"📡 Using optimized proxy: {get_proxied_url(url)[:60]}...")
+            if self._is_live_stream(url, self._last_start_raw):
+                proxied = f"http://127.0.0.1:8899/livepipe/{urllib.parse.quote(url, safe='')}"
+                print(f"📡 LIVEPIPE: {proxied[:90]}...")
+                try:
+                    self.player['force-seekable'] = 'no'
+                    self.player['demuxer-seekable-cache'] = 'no'
+                    # Небольшой cache для live: 0 секунд приводил к underrun на
+                    # сыром TS. 4с дают mpv запас, чтобы держать A/V ровно.
+                    self.player['cache-secs'] = '4'
+                    self.player['demuxer-readahead-secs'] = '4'
+                    self.player['demuxer-max-back-bytes'] = '0'
+                    self.player['demuxer-hysteresis-secs'] = '2'
+                    # Гарантируем нормальный тайминг для live (untimed off) и
+                    # мягкую коррекцию A/V вместо накопления desync.
+                    self.player['untimed'] = 'no'
+                    self.player['video-sync'] = 'audio'
+                except Exception:
+                    pass
+            else:
+                proxied = get_proxied_url(url)
+                print(f"📡 PROXY: {proxied[:90]}...")
+            self.player.play(proxied)
         else:
-            print("🎬 Playing directly...")
+            try:
+                # User-Agent задаём ТОЛЬКО через опцию user-agent.
+                # НЕЛЬЗЯ дублировать его в http-header-fields: ffmpeg тогда отправляет
+                # два заголовка User-Agent и отклоняет HLS-запрос с ошибкой -13
+                # (проверено: любой канал M3U/M3U8 при этом переставал играть).
+                self.player["user-agent"] = BROWSER_HEADERS["User-Agent"]
+                # Сбрасываем заголовки, которые мог оставить предыдущий (проксированный) поток.
+                self.player["http-header-fields"] = ""
+            except Exception:
+                pass
+            print(f"🎬 DIRECT: {url[:80]}...")
             self.player.play(url)
+
+    @Slot(object)
+    def _run_on_gui(self, fn):
+        """Выполняет callable на GUI-thread. Сюда приходят задачи, заэмиченные
+        из mpv observer/callback threads, чтобы безопасно работать с QTimer/UI."""
+        try:
+            if callable(fn):
+                fn()
+        except Exception as e:
+            print(f"⚠️ _run_on_gui error: {e}")
+
+    def _gui_call(self, fn):
+        """Хелпер: запланировать callable на GUI-thread через сигнал."""
+        try:
+            self.runOnGui.emit(fn)
+        except Exception:
+            pass
 
     def _do_reconnect(self):
         if not self._last_url:
             return
+        self._live_rejoin_pending = False
         print(f"[Player] Reconnecting attempt {self._retry_count}/5...")
         try:
             self._play_url(self._last_url)
@@ -1291,17 +2137,94 @@ class IPTVCore(QObject):
             print(f"[Player] Reconnect error: {e}")
             self._schedule_reconnect()
 
-    def _handle_playback_end(self):
+    @Slot(str)
+    def _perform_live_rejoin(self, reason="buffer"):
+        if not self._live_rejoin_pending:
+            return
+        if not self._last_url:
+            self._live_rejoin_pending = False
+            return
+        print(f"📡 [LIVE] Performing rejoin on GUI thread ({reason})")
         try:
-            is_live = (self.duration == 0.0)
-            if is_live and self._last_url:
-                print("📺 Live stream EOF, treating as disconnect...")
-                self._schedule_reconnect()
-            else:
-                self._retry_count = 0
-                self._set_status("Конец воспроизведения")
+            self._do_reconnect()
         except Exception as e:
-            print(f"⚠️ handle_playback_end error: {e}")
+            self._live_rejoin_pending = False
+            print(f"⚠️ [LIVE] rejoin error: {e}")
+
+    def _maybe_rejoin_live_edge(self, reason="buffer"):
+        if not self._is_live_stream(self._last_url, self._last_start_raw):
+            return False
+        if not (HAS_MPV and self.player and self._init):
+            return False
+        if self._live_rejoin_pending:
+            return False
+        try:
+            pos = self.player.time_pos
+            dur = self.player.duration
+        except Exception:
+            pos = dur = None
+
+        # Для live duration/time_pos часто плавающие, но если ползунок уже почти
+        # в самом конце окна, безопаснее заново открыть URL и прыгнуть к fresh edge.
+        near_end = False
+        try:
+            if pos is not None and dur is not None and dur > 0:
+                near_end = pos >= max(0.0, dur - 3.0)
+        except Exception:
+            near_end = False
+
+        if not near_end and reason != "end":
+            return False
+
+        self._live_rejoin_pending = True
+        print(f"📡 [LIVE] Rejoin live edge ({reason})")
+        self._set_status("LIVE: догоняю прямой эфир...")
+        try:
+            self.requestLiveRejoin.emit(reason)
+        except Exception:
+            self._live_rejoin_pending = False
+            return False
+        return True
+
+    def _handle_playback_end(self):
+        # ВАЖНО: этот метод вызывается из mpv event callback thread, НЕ из GUI thread.
+        # Поэтому здесь НЕЛЬЗЯ напрямую дёргать _play_url()/_apply_stream_optimizations(),
+        # которые внутри ставят QTimer.singleShot — иначе получаем
+        # "QObject::startTimer: current thread's event dispatcher has already been destroyed"
+        # и reopen storm. Всю работу делегируем на GUI thread через сигнал + cooldown.
+        is_live = self._is_live_stream(self._last_url, self._last_start_raw)
+        if is_live and self._last_url:
+            now = time.time()
+
+            # Cooldown: не переоткрываем live чаще, чем раз в LIVE_REOPEN_COOLDOWN секунд.
+            # Это убивает reopen storm, который провоцировал у origin'а HTTP 429.
+            LIVE_REOPEN_COOLDOWN = 6.0
+            since = now - self._last_live_reopen_at
+            if since < LIVE_REOPEN_COOLDOWN:
+                # Слишком частый EOF — почти наверняка LIVEPIPE сам переживёт паузу
+                # (он держит соединение и backoff-ит 429 внутри). Не дёргаем reopen.
+                print(f"📺 Live EOF ignored (cooldown {LIVE_REOPEN_COOLDOWN - since:.1f}s) — даём LIVEPIPE восстановиться")
+                return
+
+            if self._live_rejoin_pending:
+                # Уже есть запланированный rejoin — не плодим второй.
+                return
+
+            self._last_live_reopen_at = now
+            self._live_reopen_count += 1
+            self._live_rejoin_pending = True
+            print(f"📺 Live stream temporary EOF; reopening live URL (reopen #{self._live_reopen_count})...")
+            try:
+                # Перекидываем reopen на GUI thread — там безопасно вызывать
+                # _play_url()/_apply_stream_optimizations() с их QTimer.singleShot.
+                self.requestLiveRejoin.emit('eof')
+            except Exception as e:
+                print(f"⚠️ Live reopen dispatch failed: {e}")
+                self._live_rejoin_pending = False
+            return
+        # Disable auto-reconnect for completed VOD/archive playback
+        self._retry_count = 0
+        print("📺 Stream ended")
 
     def _handle_playback_error(self, err):
         print(f"⚠️ Playback error: {err}")
@@ -1448,8 +2371,10 @@ class IPTVCore(QObject):
     @Property(str, notify=qualityChanged)
     def currentQuality(self): return self._current_quality
 
-    @Property(list, notify=availableQualitiesChanged)
-    def availableQualities(self): return self._available_qualities
+    @Property(str, notify=countryChanged)
+    def targetCountry(self):
+        return f"{self._target_code} ({self._target_name})"
+
 
     @Property(bool, notify=availableQualitiesChanged)
     def ultraAvailable(self): return "ultra" in self._available_qualities
@@ -1518,16 +2443,42 @@ class IPTVCore(QObject):
     def position(self, val):
         if HAS_MPV and self.player and self._init:
             try:
-                self.player.time_pos = float(val)
+                target = float(val)
+                # Для LIVE нельзя ставить ползунок ровно в самый конец окна:
+                # mpv там часто зависает в бесконечной буферизации. Оставляем
+                # маленький безопасный отступ от live edge.
+                if self._is_live_stream(self._last_url, self._last_start_raw):
+                    dur = self.player.duration
+                    if dur is not None and dur > 3:
+                        target = min(target, max(0.0, float(dur) - 2.0))
+                self.player.time_pos = target
                 if self.player.pause:
                     self.player.pause = False
                 self.positionChanged.emit()
             except Exception:
                 pass
 
+    @Property(bool, notify=durationChanged)
+    def isLive(self):
+        """True для LIVE-потоков. QML использует это, чтобы скрыть бессмысленный
+        ползунок длительности (live mpv нередко рапортует мусорную duration,
+        из-за чего раньше показывалось «10 часов»)."""
+        try:
+            return bool(self._is_live_stream(self._last_url, self._last_start_raw))
+        except Exception:
+            return False
+
     @Property(float, notify=durationChanged)
     def duration(self):
         if HAS_MPV and self.player and self._init:
+            # Для LIVE не отдаём duration в UI: mpv часто рапортует огромное/мусорное
+            # значение (наблюдалось «10 часов»). Возвращаем 0 → QML прячет ползунок
+            # и показывает индикатор прямого эфира вместо позиции.
+            try:
+                if self._is_live_stream(self._last_url, self._last_start_raw):
+                    return 0.0
+            except Exception:
+                pass
             v = self.player.duration
             if v is not None:
                 return float(v)
@@ -1607,7 +2558,11 @@ class IPTVCore(QObject):
                             "pwd": r.get("xtream_pwd") or ""}
             self._content_mode = "live"
             self._series_info_cache = {}
-            self._rebuild_indexes()   # мгновенная фильтрация и EPG
+            self._rebuild_indexes()
+
+            # Дополнительная очистка предсказаний
+            
+            
             favs = self.db.fetchall(
                 "SELECT channel_id FROM favorites WHERE playlist_id=?", (pid,))
             self._fav_ids = {f["channel_id"] for f in favs}
@@ -1947,7 +2902,7 @@ class IPTVCore(QObject):
     def predictNextChannel(self, current_ch):
         """Многоступенчатое предсказание + префетч топ-кандидатов.
         Учитывает последовательность, время суток, день недели, категорию.
-        Ищет кандидатов по ВСЕМУ контенту (каналы + фильмы + сериалы)."""
+        Ищет кандидатов **ТОЛЬКО В ТЕКУЩЕМ ПЛЕЙЛИСТЕ**."""
         try:
             if not current_ch or not isinstance(current_ch, dict):
                 return None
@@ -1956,6 +2911,7 @@ class IPTVCore(QObject):
             now_struct = time.localtime(time.time())
             cur_hour, cur_wday = now_struct.tm_hour, now_struct.tm_wday
 
+            pl_id = self.current_playlist_id or 0
             candidates = {}
 
             def _add(cid, name, cat, score, source):
@@ -1967,41 +2923,41 @@ class IPTVCore(QObject):
                 else:
                     candidates[cid] = (name, cat, score, source)
 
-            # 1. Последовательная (>=3 подтверждений)
+            # 1. Последовательная (>=3 подтверждений) — только в текущем плейлисте
             for r in self.db.fetchall(
                 """SELECT ch2.channel_id AS cid, ch2.channel_name AS cname, ch2.category AS cat, COUNT(*) AS cnt
                    FROM click_history ch1
                    JOIN click_history ch2 ON ch2.ts > ch1.ts AND ch2.ts < ch1.ts + 120
                                           AND ch2.channel_id != ch1.channel_id
-                   WHERE ch1.channel_id = ? AND ABS(ch1.hour - ?) <= 2
+                   WHERE ch1.channel_id = ? AND ch1.playlist_id = ? AND ABS(ch1.hour - ?) <= 2
                    GROUP BY ch2.channel_id ORDER BY cnt DESC LIMIT 5""",
-                (cur_id, cur_hour)):
+                (cur_id, pl_id, cur_hour)):
                 if r["cnt"] >= 3:
                     _add(r["cid"], r["cname"], r["cat"], r["cnt"] * 10, "seq")
 
-            # 2. Популярный в этот час (±1)
+            # 2. Популярный в этот час (±1) — только в текущем плейлисте
             for r in self.db.fetchall(
                 """SELECT channel_id AS cid, channel_name AS cname, category AS cat, COUNT(*) AS cnt
-                   FROM click_history WHERE ABS(hour - ?) <= 1
+                   FROM click_history WHERE playlist_id = ? AND ABS(hour - ?) <= 1
                    GROUP BY channel_id ORDER BY cnt DESC LIMIT 5""",
-                (cur_hour,)):
+                (pl_id, cur_hour,)):
                 _add(r["cid"], r["cname"], r["cat"], r["cnt"] * 2, "hour")
 
-            # 3. Популярный в этот день недели
+            # 3. Популярный в этот день недели — только в текущем плейлисте
             for r in self.db.fetchall(
                 """SELECT channel_id AS cid, channel_name AS cname, category AS cat, COUNT(*) AS cnt
-                   FROM click_history WHERE weekday = ?
+                   FROM click_history WHERE playlist_id = ? AND weekday = ?
                    GROUP BY channel_id ORDER BY cnt DESC LIMIT 5""",
-                (cur_wday,)):
+                (pl_id, cur_wday,)):
                 _add(r["cid"], r["cname"], r["cat"], r["cnt"], "weekday")
 
-            # 4. Из той же категории
+            # 4. Из той же категории — только в текущем плейлисте
             if cur_cat:
                 for r in self.db.fetchall(
                     """SELECT channel_id AS cid, channel_name AS cname, COUNT(*) AS cnt
-                       FROM click_history WHERE category = ?
+                       FROM click_history WHERE playlist_id = ? AND category = ?
                        GROUP BY channel_id ORDER BY cnt DESC LIMIT 3""",
-                    (cur_cat,)):
+                    (pl_id, cur_cat,)):
                     _add(r["cid"], r["cname"], cur_cat, r["cnt"] * 0.5, "cat")
 
             if not candidates:
@@ -2018,6 +2974,18 @@ class IPTVCore(QObject):
                         break
 
             top_id, (top_name, top_cat, top_score, top_src) = top5[0]
+
+            # FINAL SAFETY: only return channels that actually exist in the current playlist
+            current_ids = {str(c.get('id')) for c in (self._ch or [])}
+            if top_id not in current_ids:
+                # Find first candidate that actually exists in this playlist
+                for cid, (cname, ccat, cscore, csrc) in sorted_cands:
+                    if cid in current_ids:
+                        return {'id': cid, 'name': cname, 'category': ccat,
+                                'confidence': min(int(cscore), 100), 'source': csrc,
+                                'candidates_count': len(top5)}
+                return None
+
             return {'id': top_id, 'name': top_name, 'category': top_cat,
                     'confidence': min(int(top_score), 100), 'source': top_src,
                     'candidates_count': len(top5)}
@@ -2058,31 +3026,16 @@ class IPTVCore(QObject):
             # 3. Переключение видеодорожки (мульти-битрейт внутри потока) — на лету
             self._apply_runtime_quality_track(quality)
 
-            # 4. ABR-выбор через HLS-прокси (только для проксируемых потоков!).
-            # Перезагрузка прямых Xtream-потоков с max_connections=1 убивает плейбэк.
-            if self._last_url and self._needs_proxy(self._last_url):
-                HLSCache.clear()
-                pos = self.player.time_pos
-                is_live = (self.duration == 0.0)
-
-                print(f"🔄 [Quality] Reloading proxied stream for HLS variant '{quality}'...")
-                self._play_url(self._last_url)
-
-                if not is_live and pos is not None and pos > 0:
-                    def restore_position():
-                        time.sleep(1.2)
-                        try:
-                            self.player.time_pos = pos
-                            print(f"🕒 [Quality] Position restored to {pos:.1f}s")
-                        except Exception:
-                            pass
-                    threading.Thread(target=restore_position, daemon=True).start()
-            else:
-                print(f"📺 [Quality] Direct stream — только vf-масштабирование, без релоада")
+            # 4. Для проксированных Xtream-потоков НЕ делаем полный релоад при смене качества!
+            # Это вызывает бесконечную перезагрузку и ошибку -13.
+            # Оставляем только масштабирование + ограничение кэша.
+            # Quality buttons now work for ALL sources via vf scaling only.
+            # No network requests, no cache clearing, no reloads.
+            print(f"📺 [Quality] {quality} → vf scaling only")
         except Exception as e:
             print(f"⚠️ Quality setting error: {e}")
 
-        HLSCache.clear()
+        # Never clear HLS cache on quality change - it kills the stream
         return quality
 
     def _apply_video_scaling(self, quality):
@@ -2239,16 +3192,37 @@ class IPTVCore(QObject):
         print(f"🎬 Playing: {name}")
         print(f"   URL: {f_url[:80]}...")
 
+        # Reset proxy state so the new playlist works correctly
+        global MASTER_FETCHED, SEEN_MASTERS
+        MASTER_FETCHED = False
+        SEEN_MASTERS.clear()
+        HLSCache.clear()
+
         self._last_url = f_url
         self._last_channel_name = name
         self._last_category = category
+        self._last_start_raw = start_raw or ""
         self._retry_count = 0
+        # Сбрасываем live-reopen state при старте нового канала, чтобы cooldown
+        # от предыдущего канала не блокировал восстановление нового.
+        self._last_live_reopen_at = 0.0
+        self._live_reopen_count = 0
+        self._live_rejoin_pending = False
         self._available_qualities = ["auto", "ultra", "high", "medium", "low", "minimal"]
         self.availableQualitiesChanged.emit()
         self._qualities_analyzed = False
         self._set_status("Воспроизведение...")
+        # Сразу обновим UI: для live duration=0 → QML покажет бейдж LIVE,
+        # а не унаследованную «10 часов» от предыдущего VOD.
+        self.durationChanged.emit()
+        self.positionChanged.emit()
 
-        self._target_code, self._target_name = "ALL", "Глобальный"
+        # Всегда сбрасываем страну при запуске нового канала
+        self._target_code = "ALL"
+        self._target_name = "Глобальный"
+        self.countryChanged.emit()   # <-- обновляем QML сразу
+
+        # Запускаем определение страны именно для этого канала
         threading.Thread(target=self._detect_country, args=(f_url, category, name), daemon=True).start()
 
         try:
@@ -2280,22 +3254,48 @@ class IPTVCore(QObject):
             p['demuxer-readahead-secs'] = CacheConfig.READAHEAD_SECS
             p['demuxer-hysteresis-secs'] = CacheConfig.HYSTERESIS_SECS
             p['network-timeout'] = CacheConfig.NETWORK_TIMEOUT
-            try: p['live-keepalive'] = 'yes'
-            except Exception: pass
-            p['force-seekable'] = 'yes'
+            is_live = self._is_live_stream(self._last_url, self._last_start_raw)
+            try:
+                p['live-keepalive'] = 'yes'
+            except Exception:
+                pass
+            # Для LIVEPIPE/direct-TS нужен режим настоящего live, а не seekable cache.
+            # Иначе mpv/QML видят конец текущего буфера как конец файла: пропадает
+            # LIVE-плашка, кадр блюрится/замирает и поток стопается на ~2 минутах.
+            if is_live:
+                p['force-seekable'] = 'no'
+                try:
+                    p['demuxer-seekable-cache'] = 'no'
+                except Exception:
+                    pass
+                # 4с буфера вместо 0 — иначе сырой TS уходит в underrun, а с ним
+                # ползёт AV-desync. С небольшим cache mpv держит A/V ровно.
+                p['cache-secs'] = '4'
+                p['demuxer-max-back-bytes'] = '0'
+                p['demuxer-readahead-secs'] = '4'
+                p['demuxer-hysteresis-secs'] = '2'
+                try:
+                    p['untimed'] = 'no'
+                    p['video-sync'] = 'audio'
+                except Exception:
+                    pass
+            else:
+                p['force-seekable'] = 'yes'
+                try:
+                    p['demuxer-seekable-cache'] = 'yes'
+                except Exception:
+                    pass
+                p['cache-secs'] = CacheConfig.CACHE_SECS
+                p['demuxer-max-back-bytes'] = CacheConfig.MAX_BACK_BYTES
+                p['demuxer-readahead-secs'] = CacheConfig.READAHEAD_SECS
+                p['demuxer-hysteresis-secs'] = CacheConfig.HYSTERESIS_SECS
 
             # Применяем качество ЧЕРЕЗ ЗАДЕРЖКУ — когда поток уже открыт и
             # video_params доступны. Безопасно для прямых Xtream-потоков.
             stream_optimizer.quality_level = self._current_quality
-            try:
-                QTimer.singleShot(3000, self._safe_apply_quality)
-            except Exception:
-                pass
-
-            try:
-                QTimer.singleShot(2500, self._update_available_qualities_from_tracks)
-            except Exception:
-                pass
+            # Создание QTimer планируем на GUI-thread (защита от вызова из mpv-потока).
+            self._gui_call(lambda: QTimer.singleShot(3000, self._safe_apply_quality))
+            self._gui_call(lambda: QTimer.singleShot(2500, self._update_available_qualities_from_tracks))
 
             print(f"[Optimizer] ✅ Cache capped ({CacheConfig.MAX_BYTES}/{CacheConfig.CACHE_SECS}s, "
                   f"hysteresis={CacheConfig.HYSTERESIS_SECS}s); quality/subs/audio — выбор пользователя")
@@ -2328,6 +3328,7 @@ class IPTVCore(QObject):
             print("[SAVER] Пропускаем DNS+HTTP для определения страны канала")
         self._target_code = code
         self._target_name = cn
+        self.countryChanged.emit()
         print(f"🎯 Country: {code} ({cn})")
 
     @Slot(str)
@@ -2359,6 +3360,8 @@ class IPTVCore(QObject):
 
     @Slot(str, result=str)
     def getFallback(self, channel_name):
+        # Slot объявлен result=str → нельзя возвращать None (PySide6 ругается/отдаёт мусор).
+        # Возвращаем пустую строку как «нет резервного потока».
         fallback = get_fallback_url(channel_name)
         if fallback:
             print(f"[Player] Trying fallback: {fallback[:50]}...")
@@ -2368,7 +3371,7 @@ class IPTVCore(QObject):
                 return fallback
             except Exception:
                 pass
-        return None
+        return ""
 
 
 def _append_utc(url, start_raw):

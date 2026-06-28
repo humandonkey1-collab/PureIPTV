@@ -60,7 +60,10 @@ ApplicationWindow {
     property string deviceType: {
         var isMobile = (Qt.platform.os === "android" || Qt.platform.os === "ios")
         var diagonal = Math.sqrt(Screen.width * Screen.width + Screen.height * Screen.height) / Screen.pixelDensity / 25.4
-        if (isMobile && (diagonal > 20 || Screen.width >= 1920 && Screen.height >= 1080 && !Screen.hasTouchScreen)) return "TV"
+        // ВНИМАНИЕ: у QML-объекта Screen НЕТ свойства hasTouchScreen — оно всегда
+        // undefined (→ false), из-за чего прежнее условие работало непредсказуемо.
+        // Определяем ТВ-приставку по большой диагонали или FullHD+ разрешению.
+        if (isMobile && (diagonal > 20 || (Screen.width >= 1920 && Screen.height >= 1080))) return "TV"
         if (isMobile) return diagonal >= 7.0 ? "Tablet" : "Phone"
         return "PC"
     }
@@ -418,12 +421,12 @@ ApplicationWindow {
                             radius: 20
                             color: {
                                 if ((plistGrid.currentIndex === index && plistGrid.activeFocus)) return c_surface3
-                                if (playlistMouseArea.hovered) return c_surface2
+                                if (playlistMouseArea.containsMouse) return c_surface2
                                 return c_surface
                             }
                             border.color: {
                                 if (plistGrid.currentIndex === index && plistGrid.activeFocus) return c_accent
-                                if (playlistMouseArea.hovered) return Qt.rgba(0.145, 0.902, 0.643, 0.5)
+                                if (playlistMouseArea.containsMouse) return Qt.rgba(0.145, 0.902, 0.643, 0.5)
                                 return c_borderSoft
                             }
                             border.width: (plistGrid.currentIndex === index && plistGrid.activeFocus) ? 2 : 1
@@ -442,7 +445,7 @@ ApplicationWindow {
                                     GradientStop { position: 0.0; color: c_accent }
                                     GradientStop { position: 1.0; color: c_info }
                                 }
-                                opacity: (plistGrid.currentIndex === index && plistGrid.activeFocus) || playlistMouseArea.hovered ? 1.0 : 0.0
+                                opacity: (plistGrid.currentIndex === index && plistGrid.activeFocus) || playlistMouseArea.containsMouse ? 1.0 : 0.0
                                 Behavior on opacity { NumberAnimation { duration: 160 } }
                             }
 
@@ -497,7 +500,7 @@ ApplicationWindow {
 
                                 IconButton {
                                     text: "🗑"
-                                    Layout.alignment: Qt.AlignTopRight | Qt.AlignRight
+                                    Layout.alignment: Qt.AlignTop | Qt.AlignRight
                                     z: 10
                                     accentColor: c_danger
                                     onClicked: {
@@ -938,21 +941,24 @@ ApplicationWindow {
                         }
 
                         delegate: ItemDelegate {
+                            id: chanDelegate
                             width: clist.width
                             height: window.channelIconSize + Math.round(26 * scaleFactor)
                             property bool isActive: (clist.currentIndex === index && clist.activeFocus)
 
+                            // Ссылаемся на делегат через явный id (chanDelegate), а не через
+                            // parent / parent.parent — так надёжнее и не зависит от глубины вложенности.
                             background: Rectangle {
                                 anchors.fill: parent; anchors.leftMargin: 10; anchors.rightMargin: 10
                                 radius: 14
                                 color: {
-                                    if (parent.isActive) return c_surface2
+                                    if (chanDelegate.isActive) return c_surface2
                                     if (window.selCh === modelData) return c_surface
                                     return "transparent"
                                 }
-                                border.color: parent.isActive ? c_accent : (hovered ? Qt.rgba(0.145, 0.902, 0.643, 0.45) : "transparent")
-                                border.width: parent.isActive ? 1.5 : 1
-                                Rectangle { anchors.left: parent.left; anchors.verticalCenter: parent.verticalCenter; width: 3; height: 30; radius: 1.5; color: c_accent; visible: parent.parent.isActive }
+                                border.color: chanDelegate.isActive ? c_accent : (chanDelegate.hovered ? Qt.rgba(0.145, 0.902, 0.643, 0.45) : "transparent")
+                                border.width: chanDelegate.isActive ? 1.5 : 1
+                                Rectangle { anchors.left: parent.left; anchors.verticalCenter: parent.verticalCenter; width: 3; height: 30; radius: 1.5; color: c_accent; visible: chanDelegate.isActive }
                                 Behavior on color { ColorAnimation { duration: 130 } }
                             }
 
@@ -1027,8 +1033,8 @@ ApplicationWindow {
                                 if (activeFocus) {
                                     backend.prefetchChannel(modelData)
                                     var pred = backend.predictNextChannel(modelData)
-                                    if (pred && pred.confidence >= 30) statusTip.show("⚡ Вероятно: " + pred.name)
-                                    else if (pred) statusTip.show("🔥 " + pred.candidates_count + " каналов готовы")
+                                    if (pred && pred.confidence >= 30) statusTip.show("⚡ Вероятно (в этом плейлисте): " + pred.name)
+                                    else if (pred) statusTip.show("🔥 " + pred.candidates_count + " каналов готовы в этом плейлисте")
                                 }
                             }
                             onClicked: selectChannel()
@@ -1279,7 +1285,9 @@ ApplicationWindow {
             Keys.onRightPressed: { prootOsd.playNextChannel(); showOsdTemporarily() }
             Keys.onReturnPressed: { backend.togglePause(); showOsdTemporarily() }
             Keys.onEnterPressed: { backend.togglePause(); showOsdTemporarily() }
-            Keys.onPressed: {
+            // Qt6/PySide6: параметр event нужно объявлять явно (стрелочная функция),
+            // иначе предупреждение «Injection of parameters into signal handlers is deprecated».
+            Keys.onPressed: (event) => {
                 if (event.key === Qt.Key_R) { if (window.selCh) backend.play(window.selCh.url, window.selCh.name, window.selCh.group, ""); event.accepted = true }
             }
 
