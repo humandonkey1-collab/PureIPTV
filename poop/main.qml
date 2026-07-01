@@ -211,6 +211,125 @@ ApplicationWindow {
         onAccepted: if (targetId !== -1) backend.deletePlaylist(targetId)
     }
 
+    // ----------------------- ДИАЛОГ ПЕРЕДАЧИ ПЛЕЙЛИСТА ---------------------
+    Dialog {
+        id: transferDialog
+        anchors.centerIn: parent
+        modal: true
+        standardButtons: Dialog.Close
+        width: Math.min(560, window.width - 40)
+        padding: 0
+        property string plUrl: ""
+        property string savedPath: ""
+        property int targetPid: -1
+
+        background: Rectangle {
+            color: c_surface2; radius: 20
+            border.color: c_accent; border.width: 1.5
+            Rectangle { anchors.fill: parent; color: c_accent; opacity: 0.05; radius: 20 }
+        }
+        header: Item {
+            width: parent.width; height: 68
+            Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: c_border }
+            RowLayout {
+                anchors.centerIn: parent; spacing: 10
+                Rectangle { width: 34; height: 34; radius: 17; color: c_accent; opacity: 0.18
+                    Label { anchors.centerIn: parent; text: "📲"; font.pixelSize: 18 } }
+                Label { text: "Передать Плейлист в Televizo / ТВ"; color: c_text; font.bold: true; font.pixelSize: fsTitle + 2 }
+            }
+        }
+        contentItem: ColumnLayout {
+            spacing: 16
+            leftPadding: 26; rightPadding: 26; topPadding: 20; bottomPadding: 24
+
+            // Пояснение про выключенный ПК
+            Rectangle {
+                Layout.fillWidth: true; height: explRow.implicitHeight + 28; radius: 12
+                color: Qt.rgba(0.145, 0.902, 0.643, 0.1)
+                border.color: c_accent; border.width: 1
+                RowLayout {
+                    id: explRow; anchors.fill: parent; anchors.margins: 14; spacing: 12
+                    Label { text: "⚡"; font.pixelSize: 24; Layout.alignment: Qt.AlignTop }
+                    ColumnLayout {
+                        Layout.fillWidth: true; spacing: 4
+                        Label { text: "Работает при ВЫКЛЮЧЕННОМ компьютере!"; color: c_accent; font.bold: true; font.pixelSize: fsBody }
+                        Label {
+                            text: "Во все ссылки вшиты заголовки (User-Agent и Referer). После добавления в Televizo телевизор подключается напрямую к серверам трансляций — компьютер больше не нужен!"
+                            color: c_text2; font.pixelSize: fsSub; wrapMode: Text.WordWrap; Layout.fillWidth: true
+                        }
+                    }
+                }
+            }
+
+            FieldLabel { text: "Способ 1: Ссылка для быстрой загрузки по Wi-Fi" }
+            RowLayout {
+                Layout.fillWidth: true; spacing: 10
+                TextField {
+                    text: transferDialog.plUrl
+                    readOnly: true; Layout.fillWidth: true; font.pixelSize: fsBody
+                    selectByMouse: true
+                }
+                Button {
+                    text: "📋 Копировать"
+                    Material.background: c_accent
+                    Material.foreground: c_bgDeep
+                    font.bold: true
+                    onClicked: {
+                        backend.copyToClipboard(transferDialog.plUrl)
+                        statusTip.show("⚡ Ссылка скопирована в буфер обмена!")
+                    }
+                }
+            }
+            Label {
+                text: "Вставьте эту ссылку в Televizo во время первоначальной настройки в домашней Wi-Fi сети."
+                color: c_text3; font.pixelSize: fsSub - 1; Layout.topMargin: -8; wrapMode: Text.WordWrap; Layout.fillWidth: true
+            }
+
+            FieldLabel { text: "Способ 2: Автономный файл .m3u8 (для флешки / Telegram)" }
+            RowLayout {
+                Layout.fillWidth: true; spacing: 10
+                TextField {
+                    text: transferDialog.savedPath !== "" ? transferDialog.savedPath : "Нажмите «Сохранить файл» для экспорта..."
+                    readOnly: true; Layout.fillWidth: true; font.pixelSize: fsSub
+                    selectByMouse: true
+                }
+                Button {
+                    text: "💾 Сохранить файл"
+                    onClicked: {
+                        var path
+                        if (transferDialog.targetPid !== -1) {
+                            path = backend.exportPlaylistToFileById(transferDialog.targetPid)
+                        } else {
+                            path = backend.exportPlaylistToFile()
+                        }
+                        transferDialog.savedPath = path
+                        if (path !== "") {
+                            statusTip.show("✅ Автономный файл сохранен: " + path)
+                        } else {
+                            statusTip.show("❌ Ошибка сохранения файла")
+                        }
+                    }
+                }
+            }
+            Label {
+                text: "Сохраняет автономный плейлист на диск. Отправьте его на ТВ или телефон через Telegram или USB — будет работать без Wi-Fi и без ПК."
+                color: c_text3; font.pixelSize: fsSub - 1; Layout.topMargin: -8; wrapMode: Text.WordWrap; Layout.fillWidth: true
+            }
+        }
+        function openTransfer() {
+            targetPid = -1
+            plUrl = backend.getTelevizoPlaylistUrl()
+            savedPath = ""
+            open()
+        }
+        function openTransferById(pid) {
+            targetPid = pid
+            plUrl = backend.getTelevizoPlaylistUrlById(pid)
+            savedPath = ""
+            open()
+        }
+    }
+
     // ----------------------- НАВИГАЦИЯ -------------------------------------
     StackView {
         id: stack
@@ -311,7 +430,7 @@ ApplicationWindow {
                             }
                         }
 
-                        // кнопка «Televizo плейлист»
+                        // кнопка «Передать плейлист»
                         Rectangle {
                             width: tvzBtnTxt.implicitWidth + 44; height: 46; radius: 23
                             color: tvzBtnMa.containsMouse ? Qt.rgba(0.145, 0.902, 0.643, 0.18) : Qt.rgba(1, 1, 1, 0.06)
@@ -322,15 +441,12 @@ ApplicationWindow {
                             Behavior on scale { NumberAnimation { duration: 120 } }
                             MouseArea {
                                 id: tvzBtnMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
-                                onClicked: {
-                                    var plUrl = backend.getTelevizoPlaylistUrl()
-                                    backend.copyToClipboard(plUrl)
-                                }
+                                onClicked: transferDialog.openTransfer()
                             }
                             RowLayout {
                                 anchors.centerIn: parent; spacing: 8
                                 Label { text: "📲"; font.pixelSize: 18 }
-                                Label { id: tvzBtnTxt; text: "Televizo Плейлист"; color: tvzBtnMa.containsMouse ? c_accent : c_text; font.bold: true; font.pixelSize: fsBody; Behavior on color { ColorAnimation { duration: 160 } } }
+                                Label { id: tvzBtnTxt; text: "Передать Плейлист"; color: tvzBtnMa.containsMouse ? c_accent : c_text; font.bold: true; font.pixelSize: fsBody; Behavior on color { ColorAnimation { duration: 160 } } }
                             }
                         }
                     }
@@ -522,15 +638,23 @@ ApplicationWindow {
                                     }
                                 }
 
-                                IconButton {
-                                    text: "🗑"
+                                RowLayout {
                                     Layout.alignment: Qt.AlignTop | Qt.AlignRight
                                     z: 10
-                                    accentColor: c_danger
-                                    onClicked: {
-                                        deleteConfirmDialog.targetId = modelData.id
-                                        deleteConfirmDialog.targetName = modelData.name
-                                        deleteConfirmDialog.open()
+                                    spacing: 4
+                                    IconButton {
+                                        text: "🗑"
+                                        accentColor: c_danger
+                                        onClicked: {
+                                            deleteConfirmDialog.targetId = modelData.id
+                                            deleteConfirmDialog.targetName = modelData.name
+                                            deleteConfirmDialog.open()
+                                        }
+                                    }
+                                    IconButton {
+                                        text: "📲"
+                                        accentColor: c_accent
+                                        onClicked: transferDialog.openTransferById(modelData.id)
                                     }
                                 }
                             }
@@ -744,13 +868,9 @@ ApplicationWindow {
                     Button { text: "‹  Плейлисты"; flat: true; font.pixelSize: fsBody; onClicked: stack.pop() }
                     Button { text: "📁  Категории"; flat: true; visible: !window.showCategoriesSidebar; font.pixelSize: fsBody; onClicked: catDrawer.open() }
                     Button {
-                        text: "📲 Televizo Плейлист"
+                        text: "📲 Передать Плейлист"
                         flat: true; font.pixelSize: fsBody
-                        onClicked: {
-                            var plUrl = backend.getTelevizoPlaylistUrl()
-                            backend.copyToClipboard(plUrl)
-                            statusTip.show("⚡ Ссылка для Televizo скопирована: " + plUrl)
-                        }
+                        onClicked: transferDialog.openTransfer()
                     }
                     Label { text: backend.current_playlist_name; font.bold: true; font.pixelSize: fsTitle; color: c_text; Layout.fillWidth: true; elide: Text.ElideRight }
                     TextField { id: searchBar; placeholderText: "🔍  Поиск…"; implicitWidth: 260 * scaleFactor; font.pixelSize: fsBody; text: window.searchQuery; onTextChanged: { window.searchQuery = text; mainPageInstance.refreshChannels() } }
@@ -1577,7 +1697,7 @@ ApplicationWindow {
                         RowLayout {
                             id: tvzOsdRow; anchors.centerIn: parent; spacing: 6
                             Label { text: "📲"; font.pixelSize: 14 }
-                            Label { text: "Televizo"; color: c_accent; font.bold: true; font.pixelSize: fsSub }
+                            Label { text: "Передать ссылку"; color: c_accent; font.bold: true; font.pixelSize: fsSub }
                         }
                     }
                 }

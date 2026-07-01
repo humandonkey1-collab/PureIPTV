@@ -300,6 +300,156 @@ stream_optimizer = StreamOptimizer()
 
 
 # ============================================================
+#  BATMAN STREAM RESOLVER — БЕЗЖАЛОСТНЫЙ МУЧИТЕЛЬ ИСТОЧНИКОВ
+# ============================================================
+
+BATMAN_USER_AGENTS = [
+    BROWSER_HEADERS['User-Agent'],
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36",
+    "SmartLabs",
+    "WINK/1.28.2 (AndroidTV/9)",
+    "TiviMate/4.7.0",
+    "VLC/3.0.18 LibVLC/3.0.18",
+    "ExoPlayerDemo/2.18.1",
+    "Mozilla/5.0 (SMART-TV; Linux; Tizen 6.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/6.0 TV Safari/538.1",
+    "AppleTV6,2/11.1",
+    "Lavf/58.76.100",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/119.0",
+]
+
+class BatmanStreamResolver:
+    """
+    «Берет источник за горло как Бэтмен и пытает его, пока тот не отдаст поток».
+    Справляется с любыми ошибками: 500, 502, 503, 504, 403, 404, 429, сбоями сокетов и таймаутами.
+    Применяет ротацию User-Agent, сброс TCP-сессий, Cache-Busting параметры,
+    агрессивный экспоненциальный бекофф и возобновление разрывных потоков через Range!
+    """
+    @classmethod
+    def torture_get(cls, url, headers=None, timeout=25, stream=False, proxies=None, max_attempts=12, is_manifest=False):
+        if headers is None:
+            headers = BROWSER_HEADERS.copy()
+        
+        parsed = urllib.parse.urlparse(url)
+        origin_referer = f"{parsed.scheme}://{parsed.netloc}/"
+        
+        last_exception = None
+        current_url = url
+        
+        for attempt in range(1, max_attempts + 1):
+            req_headers = headers.copy()
+            
+            # Ротация маскировки (User-Agent) на каждой попытке после первой
+            if attempt > 1:
+                ua_idx = (attempt - 2) % len(BATMAN_USER_AGENTS)
+                req_headers['User-Agent'] = BATMAN_USER_AGENTS[ua_idx]
+                if attempt % 2 == 0:
+                    req_headers['Referer'] = origin_referer
+                    req_headers['Origin'] = f"{parsed.scheme}://{parsed.netloc}"
+                elif attempt % 3 == 0:
+                    req_headers.pop('Referer', None)
+                    req_headers.pop('Origin', None)
+                
+                # При попытках >= 3 сбрасываем keep-alive и требуем свежий сокет
+                req_headers['Connection'] = 'close'
+                req_headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+                req_headers['Pragma'] = 'no-cache'
+                
+                # Cache-Busting: если сервер упрямо отдает 404/403/500 на манифест,
+                # дописываем параметр против кэширования CDN (bypass Nginx/Cloudflare cache)
+                if is_manifest and attempt >= 3:
+                    cb = int(time.time() * 1000)
+                    if '?' in url:
+                        current_url = f"{url}&_batman_cb={cb}"
+                    else:
+                        current_url = f"{url}?_batman_cb={cb}"
+                elif not is_manifest and attempt >= 4:
+                    if '?' not in url and attempt == 4:
+                        current_url = f"{url}?version=2"
+                    elif attempt >= 5:
+                        current_url = url
+            
+            try:
+                session = http_session if attempt < 4 else requests.Session()
+                
+                r = session.get(
+                    current_url,
+                    headers=req_headers,
+                    timeout=timeout,
+                    proxies=proxies,
+                    stream=stream,
+                    verify=False,
+                    allow_redirects=True
+                )
+                
+                if r.status_code in (200, 206, 301, 302):
+                    if attempt > 1:
+                        print(f"🦇 [BATMAN] Источник СДАЛСЯ на попытке #{attempt}! (HTTP {r.status_code}): {url[:70]}")
+                        if HLSProxyHandler.core_ref:
+                            try:
+                                msg = f"🦇 Бэтмен: источник отдал поток на попытке #{attempt}!"
+                                HLSProxyHandler.core_ref._gui_call(lambda m=msg: HLSProxyHandler.core_ref._set_status(m))
+                            except Exception:
+                                pass
+                    return r
+                
+                status = r.status_code
+                print(f"🦇 [BATMAN] Попытка #{attempt}/{max_attempts} -> HTTP {status} от источника: {url[:70]}")
+                if HLSProxyHandler.core_ref and attempt > 1:
+                    try:
+                        msg = f"🦇 Бэтмен: душа источника (HTTP {status}), попытка {attempt}/{max_attempts}..."
+                        HLSProxyHandler.core_ref._gui_call(lambda m=msg: HLSProxyHandler.core_ref._set_status(m))
+                    except Exception:
+                        pass
+                
+                if not stream:
+                    r.close()
+                else:
+                    r.close()
+                
+                if status == 429:
+                    wait = 0.5 * (1.4 ** min(attempt, 6)) + random.uniform(0.1, 0.5)
+                    print(f"🦇 [BATMAN] 429 Too Many Requests -> душим лимит, ждем {wait:.1f}с...")
+                    time.sleep(wait)
+                    continue
+                elif status in (500, 502, 503, 504):
+                    wait = 0.3 * attempt + random.uniform(0.1, 0.4)
+                    time.sleep(min(wait, 3.0))
+                    continue
+                elif status in (403, 401):
+                    time.sleep(0.25)
+                    continue
+                elif status == 404:
+                    time.sleep(0.35)
+                    continue
+                else:
+                    time.sleep(0.5)
+                    continue
+                    
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, socket.error, OSError) as e:
+                last_exception = e
+                wait = min(2.5, 0.3 * attempt + random.uniform(0.1, 0.3))
+                print(f"🦇 [BATMAN] Сбой сети/сокета на попытке #{attempt}: {e} -> переподключение через {wait:.1f}с...")
+                if HLSProxyHandler.core_ref and attempt > 1:
+                    try:
+                        msg = f"🦇 Бэтмен: сбой сокета, зажимаю горло (попытка {attempt})..."
+                        HLSProxyHandler.core_ref._gui_call(lambda m=msg: HLSProxyHandler.core_ref._set_status(m))
+                    except Exception:
+                        pass
+                time.sleep(wait)
+                continue
+            except Exception as e:
+                last_exception = e
+                print(f"🦇 [BATMAN] Ошибка попытки #{attempt}: {e}")
+                time.sleep(0.4)
+                continue
+        
+        print(f"💥 [BATMAN] Источник сопротивлялся {max_attempts} попыток и не отдал поток: {url[:80]}")
+        if last_exception:
+            raise last_exception
+        raise RuntimeError(f"HTTP error after {max_attempts} Batman attempts")
+
+
+# ============================================================
 #  HLS КЭШ + ПРОКСИ
 # ============================================================
 
@@ -454,16 +604,16 @@ class HLSCache:
         proxies = {'http': self.proxy_url, 'https': self.proxy_url} if self.proxy_url else None
 
         try:
-            # Make proxy very robust for problematic M3U streams
-            response = http_session.get(
+            # Зажимаем источник как Бэтмен и требуем манифест
+            response = BatmanStreamResolver.torture_get(
                 url,
                 headers=headers,
                 timeout=25,
                 proxies=proxies,
-                verify=False,
-                allow_redirects=True
+                max_attempts=12,
+                is_manifest=True
             )
-            if response.status_code in (200, 301, 302):
+            if response.status_code in (200, 206, 301, 302):
                 content = response.content
                 try:
                     if response.headers.get('Content-Encoding') == 'gzip':
@@ -573,14 +723,11 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
 
     def _handle_playlist(self):
         """
-        Экспорт плейлиста для Televizo / TiviMate / VLC / OTT Navigator.
-        Превращает все ссылки в рабочие проксированные URL через наш сервер,
-        обходя любые проверки User-Agent, Referer, SSL и CORS на стороне Televizo!
+        Экспорт автономного плейлиста для Televizo / TiviMate / VLC / OTT Navigator.
+        Превращает все ссылки в автономные URL с вшитыми заголовками,
+        которые работают НАПРЯМУЮ на ТВ или телефоне при ВЫКЛЮЧЕННОМ ПК!
         """
         try:
-            host_header = self.headers.get('Host', f"{get_local_ip()}:{self.port}")
-            proxy_base = f"http://{host_header}"
-
             pid = None
             if 'id=' in self.path:
                 params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
@@ -605,31 +752,12 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
                 else:
                     rows = db.fetchall("SELECT channels, movies, series FROM playlists ORDER BY id DESC LIMIT 1")
 
-            lines = ["#EXTM3U"]
             if rows:
-                row = rows[0]
-                for key, default_group in [("channels", "Каналы"), ("movies", "Фильмы"), ("series", "Сериалы")]:
-                    try:
-                        items = json.loads(row.get(key) or "[]")
-                        for item in items:
-                            url = item.get("url", "").strip()
-                            if not url:
-                                continue
-                            name = item.get("name", "Без названия").replace("\n", " ")
-                            logo = item.get("logo", "")
-                            group = item.get("group", default_group)
-                            cid = item.get("id", "")
+                content_str = generate_autonomous_playlist_text(rows[0])
+            else:
+                content_str = "#EXTM3U\n"
 
-                            if "/live/" in url.lower() or "/movie/" in url.lower() or "/series/" in url.lower():
-                                proxied_url = f"{proxy_base}/livepipe/{urllib.parse.quote(url, safe='')}"
-                            else:
-                                proxied_url = f"{proxy_base}/hls/{urllib.parse.quote(url, safe='')}"
-                            lines.append(f'#EXTINF:-1 tvg-id="{cid}" tvg-logo="{logo}" group-title="{group}",{name}')
-                            lines.append(proxied_url)
-                    except Exception:
-                        continue
-
-            result = "\n".join(lines).encode('utf-8')
+            result = content_str.encode('utf-8')
             self.send_response(200)
             self.send_header('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8')
             self.send_header('Content-Length', str(len(result)))
@@ -637,13 +765,73 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
             self.send_header('Connection', 'close')
             self.end_headers()
             self.wfile.write(result)
-            print(f"✅ [Televizo Playlist] Sent {len(lines)//2} proxied channels")
+            print(f"✅ [Televizo Playlist] Sent autonomous playlist (works with PC turned off!)")
         except Exception as e:
             print(f"❌ [Televizo Playlist] Error: {e}")
             try:
                 self.send_error(500)
             except Exception:
                 pass
+
+
+def generate_autonomous_playlist_text(row):
+    """
+    Генерирует текст M3U-плейлиста с автономными ссылками и вшитыми заголовками,
+    который работает в Televizo, TiviMate, VLC напрямую при ВЫКЛЮЧЕННОМ ПК!
+    """
+    lines = ["#EXTM3U"]
+    ua = BROWSER_HEADERS.get('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+    
+    for key, default_group in [("channels", "Каналы"), ("movies", "Фильмы"), ("series", "Сериалы")]:
+        try:
+            items = json.loads(row.get(key) or "[]")
+            for item in items:
+                url = item.get("url", "").strip()
+                if not url:
+                    continue
+                name = item.get("name", "Без названия").replace("\n", " ")
+                logo = item.get("logo", "")
+                group = item.get("group", default_group)
+                cid = item.get("id", "")
+                
+                parsed = urllib.parse.urlparse(url)
+                origin_referer = f"{parsed.scheme}://{parsed.netloc}/"
+                
+                # Вшиваем заголовки для всех возможных типов плееров (VLC, Televizo, TiviMate, Kodi)
+                lines.append(f'#EXTINF:-1 tvg-id="{cid}" tvg-logo="{logo}" group-title="{group}",{name}')
+                lines.append(f'#EXTVLCOPT:http-user-agent={ua}')
+                lines.append(f'#EXTVLCOPT:http-referrer={origin_referer}')
+                lines.append(f'#EXTHTTP:{{"User-Agent":"{ua}","Referer":"{origin_referer}"}}')
+                
+                # Ссылка с синтаксисом трубы |
+                if '|' not in url and 'User-Agent=' not in url and 'user-agent=' not in url:
+                    auto_url = f"{url}|User-Agent={ua}&Referer={origin_referer}"
+                else:
+                    auto_url = url
+                lines.append(auto_url)
+        except Exception:
+            continue
+    return "\n".join(lines)
+
+
+def get_autonomous_url(url):
+    """
+    Создает автономную ссылку для Televizo / TiviMate / VLC / OTT Navigator,
+    которая работает НАПРЯМУЮ на телевизоре или телефоне при ПОЛНОСТЬЮ ВЫКЛЮЧЕННОМ ПК!
+    """
+    if not url:
+        return ""
+    url_clean = str(url).strip()
+    if '|' in url_clean or 'User-Agent=' in url_clean or 'user-agent=' in url_clean:
+        return url_clean
+    
+    parsed = urllib.parse.urlparse(url_clean)
+    origin_referer = f"{parsed.scheme}://{parsed.netloc}/"
+    ua = BROWSER_HEADERS.get('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+    
+    header_params = f"User-Agent={ua}&Referer={origin_referer}"
+    return f"{url_clean}|{header_params}"
+
 
     def _handle_m3u8(self, url):
         while '&amp;' in url:
@@ -738,14 +926,14 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
                     seg_headers['If-Range'] = if_range
 
                 proxies = {'http': self.proxy_url, 'https': self.proxy_url} if self.proxy_url else None
-                response = http_session.get(
+                response = BatmanStreamResolver.torture_get(
                     url,
                     headers=seg_headers,
                     timeout=30,
                     stream=True,
                     proxies=proxies,
-                    verify=False,
-                    allow_redirects=True,
+                    max_attempts=12,
+                    is_manifest=False
                 )
 
                 if response.status_code in (200, 206):
@@ -885,22 +1073,22 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
                 return default_wait
 
             def _fetch_text(current_url, timeout=20):
-                r = http_session.get(
+                r = BatmanStreamResolver.torture_get(
                     current_url,
                     headers=_playlist_headers(current_url),
                     timeout=timeout,
-                    verify=False,
-                    allow_redirects=True,
+                    proxies={'http': self.proxy_url, 'https': self.proxy_url} if self.proxy_url else None,
+                    max_attempts=12,
+                    is_manifest=True
                 )
                 try:
                     if r.status_code == 429:
-                        # Сервер просит притормозить. НЕ роняем поток — отдаём backoff наверх.
                         wait = _parse_retry_after(r, 3.0)
                         err = RuntimeError('playlist HTTP 429')
                         err.retry_after = wait
                         err.is_429 = True
                         raise err
-                    if r.status_code != 200:
+                    if r.status_code not in (200, 206):
                         raise RuntimeError(f'playlist HTTP {r.status_code}')
                     return r.text, r.url
                 finally:
@@ -1049,13 +1237,13 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
                     resp = None
                     bytes_written = 0
                     try:
-                        resp = http_session.get(
+                        resp = BatmanStreamResolver.torture_get(
                             ts_url,
                             headers=_segment_headers(ts_url),
                             timeout=(15, 120),
                             stream=True,
-                            verify=False,
-                            allow_redirects=True,
+                            max_attempts=12,
+                            is_manifest=False
                         )
                         if resp.status_code == 429:
                             wait = _parse_retry_after(resp, 3.0)
@@ -1218,13 +1406,13 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
 
                 if playlist['init_map'] and playlist['init_map'] != last_init_map:
                     try:
-                        init_resp = http_session.get(
+                        init_resp = BatmanStreamResolver.torture_get(
                             playlist['init_map'],
                             headers=_segment_headers(playlist['init_map']),
                             timeout=20,
                             stream=True,
-                            verify=False,
-                            allow_redirects=True,
+                            max_attempts=8,
+                            is_manifest=False
                         )
                         if init_resp.status_code == 200:
                             try:
@@ -1274,13 +1462,13 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
 
                     seg_resp = None
                     try:
-                        seg_resp = http_session.get(
+                        seg_resp = BatmanStreamResolver.torture_get(
                             seg_url,
                             headers=_segment_headers(seg_url),
                             timeout=20,
                             stream=True,
-                            verify=False,
-                            allow_redirects=True,
+                            max_attempts=10,
+                            is_manifest=False
                         )
                         if seg_resp.status_code == 429:
                             wait = _parse_retry_after(seg_resp, 2.0)
@@ -1359,14 +1547,14 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
                 headers['If-Range'] = if_range
 
             proxies = {'http': self.proxy_url, 'https': self.proxy_url} if self.proxy_url else None
-            response = http_session.get(
+            response = BatmanStreamResolver.torture_get(
                 url,
                 headers=headers,
                 timeout=30,
                 proxies=proxies,
                 stream=True,
-                verify=False,
-                allow_redirects=True,
+                max_attempts=12,
+                is_manifest=False
             )
             self.send_response(response.status_code)
             for key, value in response.headers.items():
@@ -1597,7 +1785,7 @@ class IPTVWorker(QThread):
 
     # --- M3U ---
     def _parse_m3u(self, url, h):
-        r = requests.get(url, headers=h, timeout=20)
+        r = BatmanStreamResolver.torture_get(url, headers=h, timeout=25, is_manifest=True)
         return self._parse_m3u_text(r.text)
 
     def _parse_m3u_file(self, path):
@@ -1649,7 +1837,7 @@ class IPTVWorker(QThread):
             url = f"{api_base}&action={action}"
             for attempt in range(retries):
                 try:
-                    r = requests.get(url, headers={**h, "Connection": "close"}, timeout=45)
+                    r = BatmanStreamResolver.torture_get(url, headers={**h, "Connection": "close"}, timeout=45, max_attempts=4)
                     txt = r.text.strip()
                     if not txt:
                         raise ValueError("пустой ответ")
@@ -1761,11 +1949,11 @@ class IPTVWorker(QThread):
     def _parse_stalker(self, h):
         base = self.host.rstrip('/')
         h["X-User-MAC"], h["Cookie"] = self.mac, f"mac={self.mac}"
-        hs = requests.get(f"{base}/server/load.php?type=stb&action=handshake", headers=h, timeout=15).json()
+        hs = BatmanStreamResolver.torture_get(f"{base}/server/load.php?type=stb&action=handshake", headers=h, timeout=15, max_attempts=5).json()
         tk = hs['js']['token']
-        res = requests.get(
+        res = BatmanStreamResolver.torture_get(
             f"{base}/server/load.php?type=itv&action=get_all_channels&token={tk}",
-            headers=h, timeout=20).json()
+            headers=h, timeout=20, max_attempts=5).json()
         return [{"id": str(c.get('tvg_id', c.get('name'))), "name": c['name'], "logo": "",
                  "group": "Stalker", "url": c['url'].split(' ')[-1]} for c in res.get('js', [])]
 
@@ -1773,7 +1961,7 @@ class IPTVWorker(QThread):
     def _load_epg(self, url, h):
         epg_db = {}
         try:
-            r = requests.get(url, headers=h, timeout=25)
+            r = BatmanStreamResolver.torture_get(url, headers=h, timeout=30, max_attempts=6)
             content = r.content
             if url.endswith('.gz') or content[:2] == b'\x1f\x8b':
                 content = gzip.decompress(content)
@@ -2825,12 +3013,24 @@ class IPTVCore(QObject):
     def getTelevizoPlaylistUrl(self):
         start_hls_proxy(None, core=self)
         local_ip = get_local_ip()
+        if self.current_playlist_id:
+            return f"http://{local_ip}:8899/playlist.m3u8?id={self.current_playlist_id}"
+        return f"http://{local_ip}:8899/playlist.m3u8"
+
+    @Slot('QVariant', result=str)
+    def getTelevizoPlaylistUrlById(self, pid):
+        start_hls_proxy(None, core=self)
+        local_ip = get_local_ip()
+        try:
+            val = int(pid.toVariant()) if hasattr(pid, 'toVariant') else int(pid)
+            if val > 0:
+                return f"http://{local_ip}:8899/playlist.m3u8?id={val}"
+        except Exception:
+            pass
         return f"http://{local_ip}:8899/playlist.m3u8"
 
     @Slot('QVariant', result=str)
     def getTelevizoLink(self, item):
-        start_hls_proxy(None, core=self)
-        local_ip = get_local_ip()
         url = ""
         if isinstance(item, dict):
             url = item.get("url", "")
@@ -2838,9 +3038,53 @@ class IPTVCore(QObject):
             url = item
         if not url:
             return ""
-        if "/live/" in url.lower() or "/movie/" in url.lower() or "/series/" in url.lower():
-            return f"http://{local_ip}:8899/livepipe/{urllib.parse.quote(url, safe='')}"
-        return f"http://{local_ip}:8899/hls/{urllib.parse.quote(url, safe='')}"
+        return get_autonomous_url(url)
+
+    @Slot(result=str)
+    def exportPlaylistToFile(self):
+        return self._do_export_playlist(self.current_playlist_id)
+
+    @Slot('QVariant', result=str)
+    def exportPlaylistToFileById(self, pid):
+        try:
+            val = int(pid.toVariant()) if hasattr(pid, 'toVariant') else int(pid)
+            return self._do_export_playlist(val)
+        except Exception:
+            return self._do_export_playlist(None)
+
+    def _do_export_playlist(self, target_pid):
+        """Сохраняет автономный плейлист в файл на диск пользователя для переноса через USB / Telegram / телефон."""
+        try:
+            db = Database("premium.db")
+            if target_pid and int(target_pid) > 0:
+                rows = db.fetchall("SELECT name, channels, movies, series FROM playlists WHERE id=?", (int(target_pid),))
+            elif self.current_playlist_id:
+                rows = db.fetchall("SELECT name, channels, movies, series FROM playlists WHERE id=?", (self.current_playlist_id,))
+            else:
+                rows = db.fetchall("SELECT name, channels, movies, series FROM playlists ORDER BY id DESC LIMIT 1")
+            
+            if not rows:
+                return ""
+            
+            row = rows[0]
+            pl_name = (row.get("name") or "Pure_IPTV").replace(" ", "_").replace("/", "_").replace("\\", "_")
+            
+            save_dir = os.path.expanduser("~/Downloads")
+            if not os.path.isdir(save_dir):
+                save_dir = os.path.expanduser("~/Desktop")
+                if not os.path.isdir(save_dir):
+                    save_dir = os.path.dirname(os.path.abspath(__file__))
+            
+            file_path = os.path.join(save_dir, f"{pl_name}_Televizo_Autonomous.m3u8")
+            content = generate_autonomous_playlist_text(row)
+            
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            print(f"✅ Autonomous playlist saved to: {file_path}")
+            return file_path
+        except Exception as e:
+            print(f"❌ Export file error: {e}")
+            return ""
 
     @Slot(str, result=bool)
     def copyToClipboard(self, text):
@@ -2874,7 +3118,7 @@ class IPTVCore(QObject):
                 return
             url = (f"{host}/player_api.php?username={user}&password={pwd}"
                    f"&action=get_series_info&series_id={sid}")
-            data = http_session.get(url, headers=BROWSER_HEADERS, timeout=30).json()
+            data = BatmanStreamResolver.torture_get(url, headers=BROWSER_HEADERS, timeout=30, max_attempts=4).json()
             self._series_info_cache[sid] = data
             self.seriesInfoReady.emit(sid)
             print(f"[Series] info loaded for {sid}: seasons={list(data.get('episodes', {}).keys())}")
@@ -2986,13 +3230,10 @@ class IPTVCore(QObject):
                             break
                 if variant_uri:
                     abs_url = make_absolute(variant_uri, url.rsplit('/', 1)[0] + '/', url)
-                    for attempt in range(self._PREFETCH_RETRIES):
-                        try:
-                            http_session.get(abs_url, headers=BROWSER_HEADERS, timeout=10, stream=True)
-                            break
-                        except Exception:
-                            if attempt == self._PREFETCH_RETRIES - 1:
-                                raise
+                    try:
+                        BatmanStreamResolver.torture_get(abs_url, headers=BROWSER_HEADERS, timeout=10, stream=True, max_attempts=3)
+                    except Exception:
+                        pass
             except Exception:
                 pass
         except Exception:
