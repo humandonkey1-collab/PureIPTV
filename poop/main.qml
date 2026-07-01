@@ -3,7 +3,8 @@ import QtQuick.Controls
 import QtQuick.Controls.Material
 import QtQuick.Layouts
 import QtQuick.Dialogs as QtDialogs
-// Аврора? Теперь это Говнора. И да, я вдохновлялся OTT Navigator, TiviMate и IPTVnator.
+
+// Aurora? Теперь это Govnaura. И да, я вдохновлялся OTT Navigator, TiviMate и IPTVnator.
 // =========================================================================
 //  PURE IPTV PLAYER  —  «Говнора» redesign
 //  Премиальный тёмный OTT-интерфейс: глубина, стекло, неон, плавность.
@@ -51,12 +52,19 @@ ApplicationWindow {
     property int currentChIndex: -1
     property string currentAspect: "no"
     property string targetVpnCountry: "Глобальный"
+    property string selSeriesId: ""
+    property string selSeriesName: ""
+    property string selSeason: ""
+    property var expandedSeasons: ({})
 
     // ============== АДАПТИВНАЯ ВЁРСТКА (ТВ / Планшет / Смартфон / ПК) ======
     property string deviceType: {
         var isMobile = (Qt.platform.os === "android" || Qt.platform.os === "ios")
         var diagonal = Math.sqrt(Screen.width * Screen.width + Screen.height * Screen.height) / Screen.pixelDensity / 25.4
-        if (isMobile && (diagonal > 20 || Screen.width >= 1920 && Screen.height >= 1080 && !Screen.hasTouchScreen)) return "TV"
+        // ВНИМАНИЕ: у QML-объекта Screen НЕТ свойства hasTouchScreen — оно всегда
+        // undefined (→ false), из-за чего прежнее условие работало непредсказуемо.
+        // Определяем ТВ-приставку по большой диагонали или FullHD+ разрешению.
+        if (isMobile && (diagonal > 20 || (Screen.width >= 1920 && Screen.height >= 1080))) return "TV"
         if (isMobile) return diagonal >= 7.0 ? "Tablet" : "Phone"
         return "PC"
     }
@@ -302,6 +310,29 @@ ApplicationWindow {
                                 Label { id: addBtnTxt; text: "Новый плейлист"; color: c_bgDeep; font.bold: true; font.pixelSize: fsBody }
                             }
                         }
+
+                        // кнопка «Televizo плейлист»
+                        Rectangle {
+                            width: tvzBtnTxt.implicitWidth + 44; height: 46; radius: 23
+                            color: tvzBtnMa.containsMouse ? Qt.rgba(0.145, 0.902, 0.643, 0.18) : Qt.rgba(1, 1, 1, 0.06)
+                            border.color: tvzBtnMa.containsMouse ? c_accent : Qt.rgba(1, 1, 1, 0.18); border.width: 1
+                            Behavior on color { ColorAnimation { duration: 160 } }
+                            Behavior on border.color { ColorAnimation { duration: 160 } }
+                            scale: tvzBtnMa.containsPress ? 0.97 : 1.0
+                            Behavior on scale { NumberAnimation { duration: 120 } }
+                            MouseArea {
+                                id: tvzBtnMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                                onClicked: {
+                                    var plUrl = backend.getTelevizoPlaylistUrl()
+                                    backend.copyToClipboard(plUrl)
+                                }
+                            }
+                            RowLayout {
+                                anchors.centerIn: parent; spacing: 8
+                                Label { text: "📲"; font.pixelSize: 18 }
+                                Label { id: tvzBtnTxt; text: "Televizo Плейлист"; color: tvzBtnMa.containsMouse ? c_accent : c_text; font.bold: true; font.pixelSize: fsBody; Behavior on color { ColorAnimation { duration: 160 } } }
+                            }
+                        }
                     }
 
                     // стат-полоса
@@ -414,12 +445,12 @@ ApplicationWindow {
                             radius: 20
                             color: {
                                 if ((plistGrid.currentIndex === index && plistGrid.activeFocus)) return c_surface3
-                                if (playlistMouseArea.hovered) return c_surface2
+                                if (playlistMouseArea.containsMouse) return c_surface2
                                 return c_surface
                             }
                             border.color: {
                                 if (plistGrid.currentIndex === index && plistGrid.activeFocus) return c_accent
-                                if (playlistMouseArea.hovered) return Qt.rgba(0.145, 0.902, 0.643, 0.5)
+                                if (playlistMouseArea.containsMouse) return Qt.rgba(0.145, 0.902, 0.643, 0.5)
                                 return c_borderSoft
                             }
                             border.width: (plistGrid.currentIndex === index && plistGrid.activeFocus) ? 2 : 1
@@ -438,7 +469,7 @@ ApplicationWindow {
                                     GradientStop { position: 0.0; color: c_accent }
                                     GradientStop { position: 1.0; color: c_info }
                                 }
-                                opacity: (plistGrid.currentIndex === index && plistGrid.activeFocus) || playlistMouseArea.hovered ? 1.0 : 0.0
+                                opacity: (plistGrid.currentIndex === index && plistGrid.activeFocus) || playlistMouseArea.containsMouse ? 1.0 : 0.0
                                 Behavior on opacity { NumberAnimation { duration: 160 } }
                             }
 
@@ -493,7 +524,7 @@ ApplicationWindow {
 
                                 IconButton {
                                     text: "🗑"
-                                    Layout.alignment: Qt.AlignTopRight | Qt.AlignRight
+                                    Layout.alignment: Qt.AlignTop | Qt.AlignRight
                                     z: 10
                                     accentColor: c_danger
                                     onClicked: {
@@ -712,31 +743,108 @@ ApplicationWindow {
                     anchors.fill: parent; anchors.leftMargin: 16; anchors.rightMargin: 16; spacing: 12
                     Button { text: "‹  Плейлисты"; flat: true; font.pixelSize: fsBody; onClicked: stack.pop() }
                     Button { text: "📁  Категории"; flat: true; visible: !window.showCategoriesSidebar; font.pixelSize: fsBody; onClicked: catDrawer.open() }
-                    Label {
-                        text: backend.current_playlist_name
-                        font.bold: true; font.pixelSize: fsTitle; color: c_text; Layout.fillWidth: true; elide: Text.ElideRight
+                    Button {
+                        text: "📲 Televizo Плейлист"
+                        flat: true; font.pixelSize: fsBody
+                        onClicked: {
+                            var plUrl = backend.getTelevizoPlaylistUrl()
+                            backend.copyToClipboard(plUrl)
+                            statusTip.show("⚡ Ссылка для Televizo скопирована: " + plUrl)
+                        }
                     }
-                    TextField {
-                        id: searchBar
-                        placeholderText: "🔍  Поиск канала…"
-                        implicitWidth: 280 * scaleFactor
-                        font.pixelSize: fsBody
-                        text: window.searchQuery
-                        onTextChanged: { window.searchQuery = text; mainPageInstance.refreshChannels() }
-                    }
+                    Label { text: backend.current_playlist_name; font.bold: true; font.pixelSize: fsTitle; color: c_text; Layout.fillWidth: true; elide: Text.ElideRight }
+                    TextField { id: searchBar; placeholderText: "🔍  Поиск…"; implicitWidth: 260 * scaleFactor; font.pixelSize: fsBody; text: window.searchQuery; onTextChanged: { window.searchQuery = text; mainPageInstance.refreshChannels() } }
                 }
             }
 
             function refreshChannels() {
-                var list = backend.getFilteredChannels(window.activeCategory, window.searchQuery)
+                var list
+                if (backend.contentMode === "movies" || backend.contentMode === "series")
+                    list = backend.getFilteredItems(window.activeCategory, window.searchQuery)
+                else
+                    list = backend.getFilteredChannels(window.activeCategory, window.searchQuery)
                 window.currentFilteredList = list
                 clist.model = list
+                clist.contentY = 0
+            }
+            function loadMore() {
+                var more = backend.getMoreFiltered()
+                if (more && more.length > 0) {
+                    var arr = window.currentFilteredList.slice()
+                    for (var i = 0; i < more.length; i++) arr.push(more[i])
+                    window.currentFilteredList = arr
+                    clist.model = arr
+                }
+            }
+
+            property int seasonsVersion: 0
+
+            function enterSeriesDetail(seriesItem) {
+                window.selSeriesId = seriesItem.id
+                window.selSeriesName = seriesItem.name
+                window.selSeason = ""
+                window.expandedSeasons = ({})
+                mainPageInstance.seasonsVersion = 0
+                backend.loadSeriesInfo(seriesItem.id)
+                seriesDetail.visible = true
+            }
+            function exitSeriesDetail() {
+                seriesDetail.visible = false
+                window.selSeriesId = ""
+                window.selSeason = ""
+                window.expandedSeasons = ({})
+                mainPageInstance.seasonsVersion = 0
+            }
+
+            // Плоская модель: сезон-заголовки + серии (только раскрытых сезонов).
+            // Параметр v (seasonsVersion) заставляет QML перевычислять binding при изменении.
+            function buildSeasonModel(v) {
+                var flat = []
+                var seasons = backend.getSeriesSeasons(window.selSeriesId)
+                for (var si = 0; si < seasons.length; si++) {
+                    var s = seasons[si]
+                    var expanded = window.expandedSeasons[s.id] === true
+                    flat.push({ type: "season", sid: s.id, name: s.name, count: s.episode_count, expanded: expanded })
+                    if (expanded) {
+                        var eps = backend.getSeasonEpisodes(window.selSeriesId, s.id)
+                        for (var ei = 0; ei < eps.length; ei++)
+                            flat.push({ type: "episode", title: eps[ei].title, num: eps[ei].episode_num, url: eps[ei].url, id: eps[ei].id })
+                    }
+                }
+                return flat
+            }
+
+            // Переключение раскрытия сезона (вызывается из делегата — надёжная область)
+            function toggleSeason(sid) {
+                var s = window.expandedSeasons
+                if (s[sid] === true) delete s[sid]
+                else s[sid] = true
+                window.expandedSeasons = ({})
+                window.expandedSeasons = s
+                mainPageInstance.seasonsVersion++
             }
 
             Component.onCompleted: {
                 refreshChannels()
                 clist.forceActiveFocus()
                 backend.prefetchVisibleChannels()
+            }
+
+            Connections {
+                target: backend
+                function onContentModeChanged() { window.activeCategory = "Все"; mainPageInstance.refreshChannels() }
+                function onSeriesInfoReady(seriesId) {
+                    if (window.selSeriesId) {
+                        var seasons = backend.getSeriesSeasons(window.selSeriesId)
+                        if (seasons.length > 0) {
+                            window.selSeason = seasons[0].id
+                            var s = ({})
+                            s[seasons[0].id] = true
+                            window.expandedSeasons = s
+                            mainPageInstance.seasonsVersion++
+                        }
+                    }
+                }
             }
 
             // Тост умного предсказания
@@ -813,10 +921,48 @@ ApplicationWindow {
                 ColumnLayout {
                     Layout.fillWidth: true; Layout.fillHeight: true; spacing: 0
 
+                    // --- ПАНЕЛЬ ВКЛАДОК: Каналы / Фильмы / Сериалы (отдельная, не падает) ---
+                    Rectangle {
+                        Layout.fillWidth: true; height: 48; visible: backend.hasVod || backend.hasSeries
+                        color: Qt.rgba(7/255, 8/255, 14/255, 0.6)
+                        Rectangle { anchors.bottom: parent.bottom; anchors.left: parent.left; anchors.right: parent.right; height: 1; color: c_borderSoft }
+                        Row {
+                            anchors.left: parent.left; anchors.leftMargin: 22; anchors.verticalCenter: parent.verticalCenter; spacing: 8
+                            Repeater {
+                                model: [ { mode: "live", icon: "📺", label: "Каналы", show: true },
+                                         { mode: "movies", icon: "🎬", label: "Фильмы", show: backend.hasVod },
+                                         { mode: "series", icon: "🎞", label: "Сериалы", show: backend.hasSeries } ]
+                                Rectangle {
+                                    visible: modelData.show; width: ctabInner.implicitWidth + 28; height: 34; radius: 17
+                                    property bool isAct: backend.contentMode === modelData.mode
+                                    color: isAct ? "transparent" : Qt.rgba(1,1,1,0.04)
+                                    border.color: isAct ? c_accent : "transparent"; border.width: 1.5
+                                    Rectangle { anchors.fill: parent; visible: isAct; radius: 17; gradient: Gradient { orientation: Gradient.Horizontal; GradientStop { position: 0.0; color: c_accent } GradientStop { position: 1.0; color: c_accent2 } } z: -1 }
+                                    MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: { backend.setContentMode(modelData.mode); mainPageInstance.exitSeriesDetail() } }
+                                    RowLayout { id: ctabInner; anchors.centerIn: parent; spacing: 6
+                                        Label { text: modelData.icon; font.pixelSize: 13; color: isAct ? c_bgDeep : c_text2 }
+                                        Label { text: modelData.label; font.bold: isAct; font.pixelSize: fsBody; color: isAct ? c_bgDeep : c_text2 }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     ListView {
                         id: clist
                         Layout.fillWidth: true; Layout.fillHeight: true
                         clip: true; boundsBehavior: Flickable.StopAtBounds; focus: true; spacing: 2
+                        // Пагинация: при прокрутке близко к концу подгружаем следующую порцию
+                        property bool _loadingMore: false
+                        onContentYChanged: {
+                            if (_loadingMore) return
+                            if (contentHeight <= 0) return
+                            if (contentY + height >= contentHeight - 400) {
+                                _loadingMore = true
+                                mainPageInstance.loadMore()
+                                _loadingMore = false
+                            }
+                        }
                         KeyNavigation.left: window.showCategoriesSidebar ? catList : null
                         KeyNavigation.right: window.showEpgSidebar ? elist : null
 
@@ -828,21 +974,24 @@ ApplicationWindow {
                         }
 
                         delegate: ItemDelegate {
+                            id: chanDelegate
                             width: clist.width
                             height: window.channelIconSize + Math.round(26 * scaleFactor)
                             property bool isActive: (clist.currentIndex === index && clist.activeFocus)
 
+                            // Ссылаемся на делегат через явный id (chanDelegate), а не через
+                            // parent / parent.parent — так надёжнее и не зависит от глубины вложенности.
                             background: Rectangle {
                                 anchors.fill: parent; anchors.leftMargin: 10; anchors.rightMargin: 10
                                 radius: 14
                                 color: {
-                                    if (parent.isActive) return c_surface2
+                                    if (chanDelegate.isActive) return c_surface2
                                     if (window.selCh === modelData) return c_surface
                                     return "transparent"
                                 }
-                                border.color: parent.isActive ? c_accent : (hovered ? Qt.rgba(0.145, 0.902, 0.643, 0.45) : "transparent")
-                                border.width: parent.isActive ? 1.5 : 1
-                                Rectangle { anchors.left: parent.left; anchors.verticalCenter: parent.verticalCenter; width: 3; height: 30; radius: 1.5; color: c_accent; visible: parent.parent.isActive }
+                                border.color: chanDelegate.isActive ? c_accent : (chanDelegate.hovered ? Qt.rgba(0.145, 0.902, 0.643, 0.45) : "transparent")
+                                border.width: chanDelegate.isActive ? 1.5 : 1
+                                Rectangle { anchors.left: parent.left; anchors.verticalCenter: parent.verticalCenter; width: 3; height: 30; radius: 1.5; color: c_accent; visible: chanDelegate.isActive }
                                 Behavior on color { ColorAnimation { duration: 130 } }
                             }
 
@@ -897,22 +1046,30 @@ ApplicationWindow {
                                     Layout.alignment: Qt.AlignVCenter
                                     onClicked: { clist.currentIndex = index; backend.toggleFavorite(modelData.id); mainPageInstance.refreshChannels() }
                                 }
+
+                                IconButton {
+                                    text: "📲"
+                                    accentColor: c_accent
+                                    Layout.alignment: Qt.AlignVCenter
+                                    onClicked: {
+                                        var tLink = backend.getTelevizoLink(modelData)
+                                        backend.copyToClipboard(tLink)
+                                        statusTip.show("⚡ Рабочая ссылка скопирована для Televizo!")
+                                    }
+                                }
                             }
 
                             function selectChannel() {
                                 clist.currentIndex = index
+                                if (backend.contentMode === "series") {
+                                    mainPageInstance.enterSeriesDetail(modelData)
+                                    return
+                                }
                                 window.selCh = modelData
                                 window.currentChIndex = index
                                 backend.updateEPG(modelData.id)
                                 backend.recordChannelClick(modelData)
                                 backend.play(modelData.url, modelData.name, modelData.group, "")
-                                var pred = backend.predictNextChannel(modelData)
-                                if (pred) {
-                                    var msg = pred.confidence >= 30
-                                        ? ("⚡ Вероятно следующий: " + pred.name + " (" + pred.confidence + "%, " + pred.source + ")")
-                                        : ("🔥 Готово к мгновенному старту: " + pred.candidates_count + " каналов")
-                                    console.log(msg)
-                                }
                                 stack.push(playerPage)
                             }
                             onHoveredChanged: if (hovered || activeFocus) backend.prefetchChannel(modelData)
@@ -920,8 +1077,8 @@ ApplicationWindow {
                                 if (activeFocus) {
                                     backend.prefetchChannel(modelData)
                                     var pred = backend.predictNextChannel(modelData)
-                                    if (pred && pred.confidence >= 30) statusTip.show("⚡ Вероятно: " + pred.name)
-                                    else if (pred) statusTip.show("🔥 " + pred.candidates_count + " каналов готовы")
+                                    if (pred && pred.confidence >= 30) statusTip.show("⚡ Вероятно (в этом плейлисте): " + pred.name)
+                                    else if (pred) statusTip.show("🔥 " + pred.candidates_count + " каналов готовы в этом плейлисте")
                                 }
                             }
                             onClicked: selectChannel()
@@ -982,6 +1139,88 @@ ApplicationWindow {
                                 onClicked: selectEpgItem()
                                 Keys.onReturnPressed: selectEpgItem()
                                 Keys.onEnterPressed: selectEpgItem()
+                            }
+                        }
+                    }
+                }
+            }
+
+            // --- ПАНЕЛЬ ДЕТАЛЕЙ СЕРИАЛА: сезоны → серии ---
+            Rectangle {
+                id: seriesDetail
+                visible: false
+                anchors.fill: parent
+                color: Qt.rgba(5/255, 6/255, 14/255, 0.97)
+                z: 100
+
+                ColumnLayout {
+                    anchors.fill: parent; anchors.margins: 34; spacing: 18
+
+                    RowLayout {
+                        Layout.fillWidth: true; spacing: 14
+                        Rectangle { width: 42; height: 42; radius: 21; color: Qt.rgba(1,1,1,0.08); border.color: c_border; border.width: 1
+                            MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: mainPageInstance.exitSeriesDetail() }
+                            Label { anchors.centerIn: parent; text: "‹"; color: c_text; font.bold: true; font.pixelSize: 22 } }
+                        Label { text: window.selSeriesName; font.bold: true; font.pixelSize: fsHeader; color: c_text; Layout.fillWidth: true; elide: Text.ElideRight }
+                        Label { text: backend.getSeriesSeasons(window.selSeriesId).length + " сезонов"; color: c_accent; font.pixelSize: fsSub; font.bold: true }
+                    }
+
+                    // --- ДЕРЕВО: сезоны как раскрывающиеся ПОДРАЗДЕЛЕНИЯ + серии внутри ---
+                    ListView {
+                        id: seasonTree
+                        Layout.fillWidth: true; Layout.fillHeight: true; clip: true; spacing: 4
+
+                        // Модель пересчитывается при изменении seasonsVersion (надёжный refresh)
+                        model: mainPageInstance.buildSeasonModel(mainPageInstance.seasonsVersion)
+
+                        delegate: Item {
+                            width: seasonTree.width
+                            height: 52
+                            readonly property bool isSeason: modelData.type === "season"
+
+                            // --- ЗАГОЛОВОК СЕЗОНА ---
+                            Rectangle {
+                                visible: parent.isSeason; anchors.fill: parent; anchors.margins: 4; radius: 12
+                                color: seaMa.containsMouse ? c_surface2 : c_surface
+                                border.color: modelData.expanded ? c_accent : c_borderSoft; border.width: modelData.expanded ? 1.5 : 1
+                                Behavior on color { ColorAnimation { duration: 130 } }
+                                MouseArea {
+                                    id: seaMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                                    onClicked: mainPageInstance.toggleSeason(modelData.sid)
+                                }
+                                RowLayout {
+                                    anchors.fill: parent; anchors.leftMargin: 16; anchors.rightMargin: 16; spacing: 12
+                                    Label { text: modelData.expanded ? "▾" : "▸"; color: c_accent; font.pixelSize: 18; font.bold: true; Layout.alignment: Qt.AlignVCenter; horizontalAlignment: Text.AlignHCenter }
+                                    Label { text: modelData.name || ""; color: c_text; font.bold: true; font.pixelSize: fsBody; Layout.fillWidth: true; Layout.alignment: Qt.AlignVCenter }
+                                    Label { text: (modelData.count || 0) + " серий"; color: c_text3; font.pixelSize: fsSub; Layout.alignment: Qt.AlignVCenter }
+                                    Label { text: "▶"; color: c_text3; font.pixelSize: 14; Layout.alignment: Qt.AlignVCenter; horizontalAlignment: Text.AlignHCenter }
+                                }
+                            }
+
+                            // --- СЕРИЯ: контент на той же горизонтали, что и заголовок сезона ---
+                            Rectangle {
+                                visible: !parent.isSeason; anchors.fill: parent; anchors.margins: 4; radius: 10
+                                color: epMa2.containsMouse ? c_surface2 : Qt.rgba(1,1,1,0.025)
+                                border.color: epMa2.containsMouse ? Qt.rgba(0.145,0.902,0.643,0.35) : "transparent"; border.width: 1
+                                Behavior on color { ColorAnimation { duration: 130 } }
+                                MouseArea {
+                                    id: epMa2; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                                    onClicked: {
+                                        var ep = { "id": modelData.id || "", "name": modelData.title || "", "logo": "", "group": "Сериалы", "url": modelData.url || "" }
+                                        window.selCh = ep
+                                        backend.play(modelData.url || "", modelData.title || "", "Сериалы", "")
+                                        stack.push(playerPage)
+                                    }
+                                }
+                                // leftMargin 44 = 16 (как у сезона) + 28 (отступ подразделения).
+                                // spacing 12 и Layout.AlignVCenter — иконка/номер и ▶ на одном уровне с ▸/названием сезона
+                                RowLayout {
+                                    anchors.fill: parent; anchors.leftMargin: 44; anchors.rightMargin: 16; spacing: 12
+                                    Rectangle { width: 32; height: 32; radius: 8; color: Qt.rgba(0.145,0.902,0.643,0.12); border.color: c_accent; border.width: 1; Layout.alignment: Qt.AlignVCenter
+                                        Label { anchors.centerIn: parent; text: modelData.num || ""; color: c_accent; font.bold: true; font.pixelSize: fsSub } }
+                                    Label { text: modelData.title || ""; color: c_text; font.pixelSize: fsBody; Layout.fillWidth: true; Layout.alignment: Qt.AlignVCenter; elide: Text.ElideRight }
+                                    Label { text: "▶"; color: c_text3; font.pixelSize: 14; Layout.alignment: Qt.AlignVCenter; horizontalAlignment: Text.AlignHCenter }
+                                }
                             }
                         }
                     }
@@ -1090,7 +1329,9 @@ ApplicationWindow {
             Keys.onRightPressed: { prootOsd.playNextChannel(); showOsdTemporarily() }
             Keys.onReturnPressed: { backend.togglePause(); showOsdTemporarily() }
             Keys.onEnterPressed: { backend.togglePause(); showOsdTemporarily() }
-            Keys.onPressed: {
+            // Qt6/PySide6: параметр event нужно объявлять явно (стрелочная функция),
+            // иначе предупреждение «Injection of parameters into signal handlers is deprecated».
+            Keys.onPressed: (event) => {
                 if (event.key === Qt.Key_R) { if (window.selCh) backend.play(window.selCh.url, window.selCh.name, window.selCh.group, ""); event.accepted = true }
             }
 
@@ -1127,58 +1368,143 @@ ApplicationWindow {
                 onTriggered: { topOsdBar.opacity = 0; bottomOsdBar.opacity = 0 }
             }
 
-            // ---- ВЕРХНИЙ БАР ----
+            // ---- ВЕРХНИЙ БАР (стеклянный, премиум) ----
             Rectangle {
                 id: topOsdBar
-                anchors.top: parent.top; width: parent.width; height: 78 * scaleFactor
+                anchors.top: parent.top
+                anchors.left: parent.left
+                anchors.right: parent.right
+                height: 88 * scaleFactor
                 visible: opacity > 0
-                color: Qt.rgba(5/255, 6/255, 14/255, 0.82)
+                color: "transparent"
                 opacity: 1
-                Behavior on opacity { NumberAnimation { duration: 220 } }
-                Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: c_border; opacity: 0.6 }
+                Behavior on opacity { NumberAnimation { duration: 260; easing.type: Easing.OutCubic } }
+
+                // стекло: мягкий градиент сверху вниз (непрозрачно → прозрачно)
+                Rectangle {
+                    anchors.fill: parent
+                    gradient: Gradient {
+                        orientation: Gradient.Vertical
+                        GradientStop { position: 0.0; color: Qt.rgba(5/255, 6/255, 14/255, 0.92) }
+                        GradientStop { position: 0.55; color: Qt.rgba(5/255, 6/255, 14/255, 0.5) }
+                        GradientStop { position: 1.0; color: Qt.rgba(5/255, 6/255, 14/255, 0.0) }
+                    }
+                }
+                // акцентное свечение сверху
+                Rectangle {
+                    anchors.fill: parent; opacity: 0.16
+                    gradient: Gradient {
+                        orientation: Gradient.Vertical
+                        GradientStop { position: 0.0; color: c_accent }
+                        GradientStop { position: 0.45; color: "transparent" }
+                    }
+                }
+                // разделитель снизу
+                Rectangle { anchors.bottom: parent.bottom; anchors.left: parent.left; anchors.right: parent.right; height: 1; color: c_border; opacity: 0.5 }
 
                 RowLayout {
-                    anchors.fill: parent; anchors.leftMargin: 20; anchors.rightMargin: 20; spacing: 14
+                    anchors.fill: parent
+                    anchors.leftMargin: 24 * scaleFactor
+                    anchors.rightMargin: 24 * scaleFactor
+                    spacing: 16
 
+                    // кнопка НАЗАД — стеклянная пилюля с подсветкой при наведении
                     Rectangle {
-                        width: backTxt.implicitWidth + 42; height: 40; radius: 20; color: "transparent"
-                        border.color: backMa.containsMouse ? c_accent : c_border; border.width: 1
-                        Behavior on border.color { ColorAnimation { duration: 140 } }
+                        width: backRow.implicitWidth + 42; height: 42; radius: 21
+                        color: backMa.containsMouse ? Qt.rgba(0.145, 0.902, 0.643, 0.16) : Qt.rgba(1, 1, 1, 0.06)
+                        border.color: backMa.containsMouse ? c_accent : Qt.rgba(1, 1, 1, 0.14); border.width: 1
+                        Behavior on color { ColorAnimation { duration: 150 } }
+                        Behavior on border.color { ColorAnimation { duration: 150 } }
+                        scale: backMa.containsPress ? 0.96 : 1.0
+                        Behavior on scale { NumberAnimation { duration: 110 } }
                         MouseArea { id: backMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: { backend.stop(); stack.pop() } }
-                        RowLayout { anchors.centerIn: parent; spacing: 7
-                            Label { text: "‹"; color: c_text; font.bold: true; font.pixelSize: 18 }
-                            Label { id: backTxt; text: "КАНАЛЫ"; color: c_text; font.bold: true; font.pixelSize: fsBody } }
+                        RowLayout {
+                            id: backRow; anchors.centerIn: parent; spacing: 8
+                            Label { text: "‹"; color: backMa.containsMouse ? c_accent : c_text; font.bold: true; font.pixelSize: 20; Behavior on color { ColorAnimation { duration: 150 } } }
+                            Label { text: "КАНАЛЫ"; color: backMa.containsMouse ? c_accent : c_text; font.bold: true; font.pixelSize: fsBody; font.letterSpacing: 0.5; Behavior on color { ColorAnimation { duration: 150 } } }
+                        }
                     }
 
-                    // имя канала
-                    RowLayout { spacing: 10; Layout.fillWidth: true
-                        Label { text: window.selCh ? window.selCh.name : "Загрузка…"; font.bold: true; font.pixelSize: fsHeader; color: c_text; elide: Text.ElideRight; Layout.maximumWidth: 380 * scaleFactor }
-                        Rectangle { visible: backend.duration === 0; width: 50; height: 20; radius: 5; color: c_live
-                            Label { anchors.centerIn: parent; text: "LIVE"; color: "white"; font.bold: true; font.pixelSize: 10 } }
+                    // имя канала + текущая передача
+                    ColumnLayout {
+                        Layout.fillWidth: true; spacing: 2
+                        RowLayout { spacing: 10
+                            Label {
+                                text: window.selCh ? window.selCh.name : "Загрузка…"
+                                font.bold: true; font.pixelSize: fsHeader + 1; color: c_text
+                                elide: Text.ElideRight; Layout.maximumWidth: 420 * scaleFactor
+                            }
+                            // LIVE-бейдж с мягкой пульсацией
+                            Rectangle {
+                                visible: backend.duration === 0; width: 50; height: 20; radius: 5; color: c_live
+                                Rectangle { anchors.fill: parent; anchors.margins: -4; radius: 9; color: c_live; z: -1
+                                    SequentialAnimation on opacity { loops: Animation.Infinite; running: backend.duration === 0; NumberAnimation { to: 0.0; duration: 950 } NumberAnimation { to: 0.55; duration: 950 } } }
+                                Label { anchors.centerIn: parent; text: "LIVE"; color: "white"; font.bold: true; font.pixelSize: 10; font.letterSpacing: 0.6 }
+                            }
+                        }
+                        Label {
+                            text: window.selCh ? backend.getCurrentEPG(window.selCh.id) : ""
+                            font.pixelSize: fsSub - 1; color: c_text2
+                            elide: Text.ElideRight; Layout.maximumWidth: 420 * scaleFactor
+                            visible: text.length > 0 && text !== "Нет программы"
+                        }
                     }
 
-                    // индикатор сигнала
-                    RowLayout { spacing: 7; Layout.alignment: Qt.AlignVCenter
+                    Item { Layout.fillWidth: true }
+
+                    // индикатор сигнала — анимированные полоски
+                    RowLayout { spacing: 10; Layout.alignment: Qt.AlignVCenter
+                        RowLayout { spacing: 3; Layout.preferredHeight: 20; Layout.alignment: Qt.AlignVCenter
+                            Repeater {
+                                model: 4
+                                Rectangle {
+                                    Layout.alignment: Qt.AlignBottom
+                                    width: 4; height: [8, 11, 14, 18][index]; radius: 2
+                                    color: {
+                                        var q = backend.connectionQuality
+                                        var lvl = q === "excellent" ? 4 : q === "good" ? 3 : q === "fair" ? 2 : q === "poor" ? 1 : 4
+                                        if (index < lvl) {
+                                            if (q === "poor") return c_danger
+                                            if (q === "fair") return c_warn
+                                            return c_accent
+                                        }
+                                        return Qt.rgba(1, 1, 1, 0.16)
+                                    }
+                                    Behavior on color { ColorAnimation { duration: 200 } }
+                                }
+                            }
+                        }
                         Label {
                             text: { var q = backend.connectionQuality
-                                if (q === "excellent") return "●●●"; if (q === "good") return "●●●"; if (q === "fair") return "●●"; if (q === "poor") return "●"; return "●●●" }
+                                return q === "excellent" ? "Отлично" : q === "good" ? "Хорошо" : q === "fair" ? "Средне" : q === "poor" ? "Плохо" : "—" }
                             color: { var q = backend.connectionQuality
-                                if (q === "excellent" || q === "good") return c_accent; if (q === "fair") return c_warn; return c_danger }
-                            font.pixelSize: 11
+                                if (q === "excellent" || q === "good") return c_accent
+                                if (q === "fair") return c_warn
+                                if (q === "poor") return c_danger
+                                return c_text2 }
+                            font.pixelSize: fsSub - 1; Layout.preferredWidth: 66; elide: Text.ElideRight
+                            Behavior on color { ColorAnimation { duration: 200 } }
                         }
-                        Label { text: { var q = backend.connectionQuality; return q === "excellent" ? "Отлично" : q === "good" ? "Хорошо" : q === "fair" ? "Средне" : q === "poor" ? "Плохо" : "—" }
-                            color: c_text2; font.pixelSize: fsSub - 1; Layout.preferredWidth: 64; elide: Text.ElideRight }
                     }
 
-                    // качество
+                    // качество — стеклянный чип
                     Rectangle {
-                        width: qTxt.implicitWidth + 44; height: 34; radius: 8; color: c_surface2; border.color: c_borderSoft; border.width: 1
-                        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: qualityMenu.open() }
-                        RowLayout { anchors.centerIn: parent; spacing: 6
-                            Label { text: "📺"; font.pixelSize: 12 }
-                            Label { id: qTxt; text: { var q = backend.currentQuality
-                                if (q === "ultra") return "4K"; if (q === "high") return "1080p"; if (q === "medium") return "720p"; if (q === "low") return "480p"; if (q === "minimal") return "360p"; return "AUTO" }
-                                color: c_accent; font.bold: true; font.pixelSize: fsSub } }
+                        width: qRow.implicitWidth + 40; height: 38; radius: 11
+                        color: qMa.containsMouse ? Qt.rgba(0.145, 0.902, 0.643, 0.16) : Qt.rgba(1, 1, 1, 0.06)
+                        border.color: qMa.containsMouse ? c_accent : Qt.rgba(1, 1, 1, 0.14); border.width: 1
+                        Behavior on color { ColorAnimation { duration: 150 } }
+                        Behavior on border.color { ColorAnimation { duration: 150 } }
+                        MouseArea { id: qMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: qualityMenu.open() }
+                        RowLayout {
+                            id: qRow; anchors.centerIn: parent; spacing: 7
+                            Label { text: "📺"; font.pixelSize: 13 }
+                            Label {
+                                id: qTxt
+                                text: { var q = backend.currentQuality
+                                    if (q === "ultra") return "4K"; if (q === "high") return "1080p"; if (q === "medium") return "720p"; if (q === "low") return "480p"; if (q === "minimal") return "360p"; return "AUTO" }
+                                color: c_accent; font.bold: true; font.pixelSize: fsSub
+                            }
+                        }
                         Menu {
                             id: qualityMenu
                             MenuItem { text: "🔄 Авто (рекомендуется)"; onTriggered: backend.setQuality("auto") }
@@ -1192,23 +1518,35 @@ ApplicationWindow {
 
                     // формат экрана
                     Rectangle {
-                        width: 34; height: 34; radius: 8; color: c_surface2; border.color: c_borderSoft; border.width: 1
-                        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: {
-                            if (window.currentAspect === "no") window.currentAspect = "16:9"
-                            else if (window.currentAspect === "16:9") window.currentAspect = "4:3"
-                            else if (window.currentAspect === "4:3") window.currentAspect = "stretch"
-                            else window.currentAspect = "no"
-                            backend.setAspectRatio(window.currentAspect) } }
-                        Label { anchors.centerIn: parent; text: "⬔"; color: c_text2; font.pixelSize: 16 }
+                        width: 38; height: 38; radius: 11
+                        color: aspectMa.containsMouse ? Qt.rgba(0.145, 0.902, 0.643, 0.16) : Qt.rgba(1, 1, 1, 0.06)
+                        border.color: aspectMa.containsMouse ? c_accent : Qt.rgba(1, 1, 1, 0.14); border.width: 1
+                        Behavior on color { ColorAnimation { duration: 150 } }
+                        Behavior on border.color { ColorAnimation { duration: 150 } }
+                        MouseArea {
+                            id: aspectMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                            onClicked: {
+                                if (window.currentAspect === "no") window.currentAspect = "16:9"
+                                else if (window.currentAspect === "16:9") window.currentAspect = "4:3"
+                                else if (window.currentAspect === "4:3") window.currentAspect = "stretch"
+                                else window.currentAspect = "no"
+                                backend.setAspectRatio(window.currentAspect)
+                            }
+                        }
+                        Label { anchors.centerIn: parent; text: "⬔"; color: aspectMa.containsMouse ? c_accent : c_text2; font.pixelSize: 16; Behavior on color { ColorAnimation { duration: 150 } } }
                     }
 
                     // экономия трафика
                     Rectangle {
-                        width: 34; height: 34; radius: 8
-                        color: backend.forceLowestVariant ? Qt.rgba(0.145, 0.902, 0.643, 0.16) : c_surface2
-                        border.color: backend.forceLowestVariant ? c_accent : c_borderSoft; border.width: 1
-                        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: saverMenu.open() }
-                        Label { anchors.centerIn: parent; text: "💰"; font.pixelSize: 14 }
+                        width: 38; height: 38; radius: 11
+                        color: backend.forceLowestVariant ? Qt.rgba(0.145, 0.902, 0.643, 0.18)
+                             : (saverMa.containsMouse ? Qt.rgba(0.145, 0.902, 0.643, 0.12) : Qt.rgba(1, 1, 1, 0.06))
+                        border.color: backend.forceLowestVariant ? c_accent : (saverMa.containsMouse ? c_accent : Qt.rgba(1, 1, 1, 0.14))
+                        border.width: 1
+                        Behavior on color { ColorAnimation { duration: 150 } }
+                        Behavior on border.color { ColorAnimation { duration: 150 } }
+                        MouseArea { id: saverMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: saverMenu.open() }
+                        Label { anchors.centerIn: parent; text: "💰"; font.pixelSize: 15 }
                         Menu {
                             id: saverMenu
                             MenuItem { text: (backend.forceLowestVariant ? "✅ " : "⬜ ") + "Самый низкий битрейт в HLS"; onTriggered: backend.forceLowestVariant = !backend.forceLowestVariant }
@@ -1218,72 +1556,188 @@ ApplicationWindow {
                             MenuItem { text: "ℹ️ Кэш: 60 с / 200 МБ"; enabled: false }
                         }
                     }
+
+                    // Ссылка для Televizo
+                    Rectangle {
+                        width: tvzOsdRow.implicitWidth + 28; height: 38; radius: 11
+                        color: tvzOsdMa.containsMouse ? Qt.rgba(0.145, 0.902, 0.643, 0.16) : Qt.rgba(1, 1, 1, 0.06)
+                        border.color: tvzOsdMa.containsMouse ? c_accent : Qt.rgba(1, 1, 1, 0.14); border.width: 1
+                        Behavior on color { ColorAnimation { duration: 150 } }
+                        Behavior on border.color { ColorAnimation { duration: 150 } }
+                        MouseArea {
+                            id: tvzOsdMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                            onClicked: {
+                                if (window.selCh) {
+                                    var tLink = backend.getTelevizoLink(window.selCh)
+                                    backend.copyToClipboard(tLink)
+                                    statusTip.show("⚡ Рабочая ссылка скопирована для Televizo!")
+                                }
+                            }
+                        }
+                        RowLayout {
+                            id: tvzOsdRow; anchors.centerIn: parent; spacing: 6
+                            Label { text: "📲"; font.pixelSize: 14 }
+                            Label { text: "Televizo"; color: c_accent; font.bold: true; font.pixelSize: fsSub }
+                        }
+                    }
                 }
             }
 
-            // ---- НИЖНИЙ БАР ----
+            // ---- НИЖНИЙ БАР (стеклянный, компактный — всё помещается) ----
             Rectangle {
                 id: bottomOsdBar
-                anchors.bottom: parent.bottom; width: parent.width; height: 168 * scaleFactor
+                anchors.bottom: parent.bottom
+                anchors.left: parent.left
+                anchors.right: parent.right
+                height: 116 * scaleFactor
                 visible: opacity > 0
-                color: Qt.rgba(5/255, 6/255, 14/255, 0.84)
+                color: "transparent"
                 opacity: 1
-                Behavior on opacity { NumberAnimation { duration: 220 } }
-                Rectangle { anchors.top: parent.top; width: parent.width; height: 1; color: c_border; opacity: 0.6 }
+                Behavior on opacity { NumberAnimation { duration: 260; easing.type: Easing.OutCubic } }
+
+                // стекло: мягкий градиент снизу вверх (прозрачно → непрозрачно)
+                Rectangle {
+                    anchors.fill: parent
+                    gradient: Gradient {
+                        orientation: Gradient.Vertical
+                        GradientStop { position: 0.0; color: Qt.rgba(5/255, 6/255, 14/255, 0.0) }
+                        GradientStop { position: 0.4; color: Qt.rgba(5/255, 6/255, 14/255, 0.55) }
+                        GradientStop { position: 1.0; color: Qt.rgba(5/255, 6/255, 14/255, 0.95) }
+                    }
+                }
+                // разделитель сверху
+                Rectangle { anchors.top: parent.top; anchors.left: parent.left; anchors.right: parent.right; height: 1; color: c_border; opacity: 0.5 }
 
                 ColumnLayout {
-                    anchors.fill: parent; anchors.margins: 18; spacing: 9
+                    anchors.fill: parent
+                    anchors.leftMargin: 24 * scaleFactor
+                    anchors.rightMargin: 24 * scaleFactor
+                    anchors.topMargin: 10 * scaleFactor
+                    anchors.bottomMargin: 12 * scaleFactor
+                    spacing: 8
 
-                    // бейджи статуса
+                    // строка: бейджи слева + программа по центру + статус справа (одна строка)
                     RowLayout { Layout.fillWidth: true; spacing: 12
-                        Rectangle { visible: backend.duration === 0; width: 64; height: 22; radius: 5; color: (backend.isPaused || backend.isBuffering) ? "#303240" : c_live
-                            RowLayout { anchors.centerIn: parent; spacing: 5
-                                Rectangle { width: 6; height: 6; radius: 3; color: (backend.isPaused || backend.isBuffering) ? c_text2 : "white"
-                                    SequentialAnimation on color { loops: Animation.Infinite; running: !backend.isPaused && !backend.isBuffering && backend.duration === 0; ColorAnimation { to: "transparent"; duration: 800 } ColorAnimation { to: "white"; duration: 800 } } }
-                                Label { text: "LIVE"; color: "white"; font.bold: true; font.pixelSize: 10 } } }
-                        Rectangle { visible: backend.isBuffering; width: 150; height: 22; radius: 5; color: Qt.rgba(0.106, 0.371, 0.122, 1.0)
-                            RowLayout { anchors.centerIn: parent; spacing: 6
-                                Label { text: "📡 БУФЕР"; color: "#A5F3D0"; font.bold: true; font.pixelSize: 10 }
-                                Label { text: backend.bufferingProgress + "%"; color: "white"; font.bold: true; font.pixelSize: 11 } } }
-                        Label { text: backend.status; font.pixelSize: fsSub - 1; color: c_text2; elide: Text.ElideRight; Layout.maximumWidth: 260 * scaleFactor }
-                        Item { Layout.fillWidth: true }
-                        // текущая программа
-                        Label { text: window.selCh ? backend.getCurrentEPG(window.selCh.id) : ""; font.pixelSize: fsSub; color: c_text2; elide: Text.ElideRight; Layout.maximumWidth: 320 * scaleFactor }
+                        // LIVE / БУФЕР
+                        Rectangle { visible: backend.duration === 0; width: 52; height: 18; radius: 5; color: (backend.isPaused || backend.isBuffering) ? "#303240" : c_live
+                            Rectangle { anchors.fill: parent; anchors.margins: -4; radius: 9; color: c_live; z: -1
+                                SequentialAnimation on opacity { loops: Animation.Infinite; running: !backend.isPaused && !backend.isBuffering && backend.duration === 0; NumberAnimation { to: 0.0; duration: 850 } NumberAnimation { to: 0.5; duration: 850 } } }
+                            RowLayout { anchors.centerIn: parent; spacing: 4
+                                Rectangle { width: 5; height: 5; radius: 3; color: (backend.isPaused || backend.isBuffering) ? c_text2 : "white" }
+                                Label { text: "LIVE"; color: "white"; font.bold: true; font.pixelSize: 9; font.letterSpacing: 0.5 } } }
+                        Rectangle { visible: backend.isBuffering; height: 18; radius: 5; color: Qt.rgba(0.106, 0.371, 0.122, 1.0); width: bufRow.implicitWidth + 18
+                            RowLayout { id: bufRow; anchors.centerIn: parent; spacing: 5
+                                Label { text: "📡 БУФЕР"; color: "#A5F3D0"; font.bold: true; font.pixelSize: 9 }
+                                Label { text: backend.bufferingProgress + "%"; color: "white"; font.bold: true; font.pixelSize: 10 } } }
+                        // программа по центру
+                        Label {
+                            text: window.selCh ? backend.getCurrentEPG(window.selCh.id) : "Программа недоступна"
+                            font.pixelSize: fsSub + 1; color: c_text; font.bold: true
+                            Layout.fillWidth: true; horizontalAlignment: Text.AlignHCenter; elide: Text.ElideRight
+                        }
+                        Label { text: backend.status; font.pixelSize: fsSub - 1; color: c_text2; elide: Text.ElideRight; Layout.maximumWidth: 200 * scaleFactor }
                     }
 
-                    // программа крупно
-                    Label {
-                        text: window.selCh ? backend.getCurrentEPG(window.selCh.id) : "Программа недоступна"
-                        font.pixelSize: fsTitle; color: c_text; font.bold: true; Layout.alignment: Qt.AlignHCenter; elide: Text.ElideRight; Layout.maximumWidth: parent.width * 0.7
-                    }
-
-                    // скроббер
-                    RowLayout { Layout.fillWidth: true; spacing: 14
+                    // скроббер (кастомный ползунок с неоновым заполнением и светящейся ручкой)
+                    RowLayout { Layout.fillWidth: true; spacing: 12
                         Label { text: formatTime(backend.position); color: c_text2; font.pixelSize: fsSub; Layout.preferredWidth: 52; horizontalAlignment: Text.AlignRight }
-                        Slider { id: progressSlider; Layout.fillWidth: true; from: 0; to: backend.duration > 0 ? backend.duration : 100; value: backend.position; onMoved: backend.position = value }
-                        Label { text: formatTime(backend.duration); color: c_text2; font.pixelSize: fsSub; Layout.preferredWidth: 52 }
+                        Slider {
+                            id: progressSlider
+                            Layout.fillWidth: true
+                            from: 0
+                            to: backend.duration > 0 ? backend.duration : 1
+                            value: backend.position
+                            enabled: backend.duration > 0
+                            onMoved: backend.position = value
+                            background: Rectangle {
+                                x: progressSlider.leftPadding
+                                y: progressSlider.topPadding + progressSlider.availableHeight / 2 - 3
+                                width: progressSlider.availableWidth; height: 6; radius: 3
+                                color: Qt.rgba(1, 1, 1, 0.14)
+                                Rectangle {
+                                    width: progressSlider.enabled ? progressSlider.visualPosition * parent.width : parent.width
+                                    height: parent.height; radius: 3
+                                    gradient: Gradient {
+                                        orientation: Gradient.Horizontal
+                                        GradientStop { position: 0.0; color: c_accent }
+                                        GradientStop { position: 1.0; color: c_accent2 }
+                                    }
+                                }
+                            }
+                            handle: Rectangle {
+                                x: progressSlider.leftPadding + progressSlider.visualPosition * progressSlider.availableWidth - width / 2
+                                y: progressSlider.topPadding + progressSlider.availableHeight / 2 - height / 2
+                                implicitWidth: 14; implicitHeight: 14; radius: 7
+                                color: "white"; border.color: c_accent; border.width: 2
+                                visible: progressSlider.enabled
+                                scale: progressSlider.pressed ? 1.15 : 1.0
+                                Behavior on scale { NumberAnimation { duration: 120 } }
+                                Rectangle { anchors.centerIn: parent; width: parent.width * 2.4; height: parent.height * 2.4; radius: width / 2; color: c_accent; opacity: progressSlider.pressed ? 0.35 : 0.0; z: -1; Behavior on opacity { NumberAnimation { duration: 120 } } }
+                            }
+                        }
+                        Label { text: backend.duration > 0 ? formatTime(backend.duration) : "LIVE"; color: c_text2; font.pixelSize: fsSub; Layout.preferredWidth: 52 }
                     }
 
-                    // управление
-                    RowLayout { Layout.fillWidth: true; spacing: 18
+                    // управление + громкость (транспорт по центру, громкость справа)
+                    RowLayout { Layout.fillWidth: true; spacing: 14
                         IconButton { text: "⏮"; onClicked: prootOsd.playPrevChannel() }
                         Rectangle {
-                            width: 52; height: 52; radius: 26
-                            gradient: Gradient { orientation: Gradient.Vertical; GradientStop { position: 0.0; color: c_accent } GradientStop { position: 1.0; color: c_accent2 } }
-                            Rectangle { anchors.fill: parent; anchors.margins: -8; radius: 34; color: c_accent; opacity: playMa.containsMouse ? 0.3 : 0.0 }
-                            scale: playMa.containsPress ? 0.94 : 1.0; Behavior on scale { NumberAnimation { duration: 110 } }
+                            width: 42 * scaleFactor; height: 42 * scaleFactor; radius: width / 2
+                            gradient: Gradient {
+                                orientation: Gradient.Vertical
+                                GradientStop { position: 0.0; color: c_accent }
+                                GradientStop { position: 1.0; color: c_accent2 }
+                            }
+                            Rectangle { anchors.fill: parent; anchors.margins: -6; radius: width / 2; color: c_accent; opacity: playMa.containsMouse ? 0.32 : 0.0; Behavior on opacity { NumberAnimation { duration: 140 } } }
+                            scale: playMa.containsPress ? 0.93 : 1.0; Behavior on scale { NumberAnimation { duration: 110 } }
                             MouseArea { id: playMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: backend.togglePause() }
-                            Label { anchors.centerIn: parent; text: backend.isPaused ? "▶" : "⏸"; color: c_bgDeep; font.pixelSize: 20 }
+                            Label {
+                                anchors.centerIn: parent; anchors.horizontalCenterOffset: backend.isPaused ? 0 : -1
+                                text: backend.isPaused ? "▶" : "⏸"; color: c_bgDeep; font.pixelSize: 16; font.bold: true
+                                horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter
+                            }
                         }
                         IconButton { text: "⏭"; onClicked: prootOsd.playNextChannel() }
 
                         Item { Layout.fillWidth: true }
 
-                        Label { text: backend.connectionQuality === "excellent" || backend.connectionQuality === "good" ? "🟢" : backend.connectionQuality === "fair" ? "🟡" : "🔴"; font.pixelSize: 18 }
+                        // индикатор соединения — точка со свечением
+                        Rectangle {
+                            id: connDot
+                            width: 9; height: 9; radius: 5; Layout.alignment: Qt.AlignVCenter
+                            property color qcolor: { var q = backend.connectionQuality
+                                if (q === "poor") return c_danger
+                                if (q === "fair") return c_warn
+                                return c_accent }
+                            color: connDot.qcolor
+                            Rectangle { anchors.centerIn: parent; width: connDot.width * 2.2; height: connDot.height * 2.2; radius: width / 2; color: connDot.qcolor; opacity: 0.3; z: -1 }
+                            Behavior on color { ColorAnimation { duration: 200 } }
+                        }
 
-                        RowLayout { spacing: 8
-                            Label { text: backend.volume === 0 ? "🔇" : "🔊"; font.pixelSize: fsTitle }
-                            Slider { id: volSlider; from: 0; to: 100; value: backend.volume; implicitWidth: 110 * scaleFactor; onMoved: backend.volume = value }
+                        // громкость
+                        RowLayout { spacing: 8; Layout.alignment: Qt.AlignVCenter
+                            Label { text: backend.volume === 0 ? "🔇" : "🔊"; font.pixelSize: fsTitle; Layout.alignment: Qt.AlignVCenter }
+                            Slider {
+                                id: volSlider
+                                from: 0; to: 100; value: backend.volume; implicitWidth: 110 * scaleFactor
+                                onMoved: backend.volume = value
+                                background: Rectangle {
+                                    x: volSlider.leftPadding
+                                    y: volSlider.topPadding + volSlider.availableHeight / 2 - 3
+                                    width: volSlider.availableWidth; height: 6; radius: 3
+                                    color: Qt.rgba(1, 1, 1, 0.14)
+                                    Rectangle {
+                                        width: volSlider.visualPosition * parent.width; height: parent.height; radius: 3
+                                        gradient: Gradient { orientation: Gradient.Horizontal; GradientStop { position: 0.0; color: c_accent } GradientStop { position: 1.0; color: c_accent2 } }
+                                    }
+                                }
+                                handle: Rectangle {
+                                    x: volSlider.leftPadding + volSlider.visualPosition * volSlider.availableWidth - width / 2
+                                    y: volSlider.topPadding + volSlider.availableHeight / 2 - height / 2
+                                    implicitWidth: 12; implicitHeight: 12; radius: 6
+                                    color: "white"; border.color: c_accent; border.width: 2
+                                }
+                            }
                         }
                     }
                 }
