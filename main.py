@@ -2,6 +2,15 @@ import os
 import sys
 from ctypes import CDLL
 
+# Логи в реальном времени: без этого на Windows stdout буферизуется блоками и
+# сообщения появляются только при выходе из канала/закрытии. line_buffering +
+# явный flush гарантируют, что диагностика видна сразу.
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
 # --- MPV preload ---
 script_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -96,8 +105,92 @@ try:
 except Exception:
     pass
 
-# Глобальная HTTP-сессия (keep-alive + переиспользование соединений)
-http_session = requests.Session()
+# ============================================================
+#  BEHAVIORAL GHOSTING CORE — Эмуляция живой сессии
+# ============================================================
+
+from collections import OrderedDict
+
+class SourceIdentity:
+    """Генерирует идеальную цифровую подпись устройства (Device DNA)."""
+    TIZEN_TV = {
+        'User-Agent': 'Mozilla/5.0 (SmartHub; SMART-TV; U; Edition; Tizen 5.0) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/3.0 Chrome/69.0.3497.106 TV Safari/537.36',
+        'Accept': '*/*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'X-Requested-With': 'com.samsung.tv.browser',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'empty',
+        'Sec-Fetch-Mode': 'cors',
+        'Sec-Fetch-Site': 'cross-site'
+    }
+
+    @classmethod
+    def get_headers(cls, url):
+        h = cls.TIZEN_TV.copy()
+        p = urllib.parse.urlparse(url)
+        h['Origin'] = f"{p.scheme}://{p.netloc}"
+        h['Referer'] = f"{p.scheme}://{p.netloc}/"
+        return h
+
+class OrderedHeaderSession(requests.Session):
+    """Сессия с жестким порядком заголовков для обхода Fingerprinting WAF."""
+    def __init__(self):
+        super().__init__()
+        self.headers = OrderedDict([
+            ('User-Agent', 'Mozilla/5.0 (SmartHub; SMART-TV; U; Edition; Tizen 5.0) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/3.0 Chrome/69.0.3497.106 TV Safari/537.36'),
+            ('Accept', '*/*'),
+            ('Accept-Language', 'en-US,en;q=0.9'),
+            ('X-Requested-With', 'com.samsung.tv.browser'),
+            ('Connection', 'keep-alive'),
+            ('Upgrade-Insecure-Requests', '1'),
+            ('Sec-Fetch-Dest', 'empty'),
+            ('Sec-Fetch-Mode', 'cors'),
+            ('Sec-Fetch-Site', 'cross-site')
+        ])
+
+class SessionMetamorph:
+    """Эмулирует поведение реального приложения (запросы к API помимо стрима)."""
+    def __init__(self, base_url):
+        self.base_url = base_url
+        self.session = OrderedHeaderSession()
+        self.last_ghost_activity = 0.0
+
+    def perform_ghost_activity(self):
+        """Имитирует активность пользователя в меню (запрос категорий/EPG)."""
+        if not self.base_url or "/live/" not in self.base_url:
+            return
+        
+        try:
+            # Парсим Xtream API из URL
+            p = urllib.parse.urlparse(self.base_url)
+            path_parts = p.path.split('/')
+            if len(path_parts) >= 4:
+                username = path_parts[2]
+                password = path_parts[3]
+                api_url = f"{p.scheme}://{p.netloc}/player_api.php?username={username}&password={password}&action=get_live_categories"
+                
+                # Легкий фоновый запрос — сервер видит 'живого' юзера
+                self.session.get(api_url, timeout=5, verify=False)
+                self.last_ghost_activity = time.time()
+                print("👻 [Ghosting] Активность сессии подтверждена через API")
+        except Exception: pass
+
+class PulseSynchronizer:
+    """Синхронизирует обновление с ритмом сервера (Target Duration)."""
+    def __init__(self):
+        self.target_duration = 2.0
+        self.drift_buffer = 0.5
+
+    def calculate_optimal_window(self, ttl):
+        # Ищем 'золотое сечение' между обновлением сегментов
+        window = ttl * 0.82
+        jitter = random.uniform(-self.target_duration, self.target_duration)
+        return max(ttl * 0.5, window + jitter)
+
+ghost_manager = None
+pulse_sync = PulseSynchronizer()
+http_session = OrderedHeaderSession() # Заменяем стандартную сессию на Ordered
 
 
 # ============================================================
@@ -454,6 +547,14 @@ class HLSCache:
         proxies = {'http': self.proxy_url, 'https': self.proxy_url} if self.proxy_url else None
 
         try:
+            # DNS check
+            p_url = urllib.parse.urlparse(url)
+            try:
+                socket.gethostbyname(p_url.netloc.split(':')[0])
+            except socket.gaierror:
+                print(f"📡 [HLS] DNS failed for {p_url.netloc}")
+                return None, headers
+
             # Make proxy very robust for problematic M3U streams
             response = http_session.get(
                 url,
@@ -1021,40 +1122,117 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
             consecutive_429 = 0
             jump_to_edge = False
 
-            # Первичный fetch тоже должен переживать 429 (а не падать в 500),
-            # иначе mpv сразу получит EOF и устроит reopen.
+            # ========================================================
+            #  BEHAVIORAL GHOSTING & PULSE SYNC
+            # ========================================================
+            ghost_manager = SessionMetamorph(refresh_from_source_url)
+            
+            token_born_at = time.time()
+            token_lifetimes = deque(maxlen=6)
+            token_safe_ttl = None
+            last_proactive_refresh = 0.0
+            refresh_lock = threading.Lock()
+            is_refreshing_flag = [False]
+
+            def _do_source_refresh():
+                nonlocal selected_audio_playlist
+                # Mimic Samsung TV signature with Ordered Headers
+                headers = ghost_manager.session.headers.copy()
+                p_url = urllib.parse.urlparse(refresh_from_source_url)
+                headers['Origin'] = f"{p_url.scheme}://{p_url.netloc}"
+                headers['Referer'] = f"{p_url.scheme}://{p_url.netloc}/"
+                headers['User-Agent'] = 'Mozilla/5.0 (SmartHub; SMART-TV; U; Edition; Tizen 5.0) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/3.0 Chrome/69.0.3497.106 TV Safari/537.36'
+                
+                r = ghost_manager.session.get(refresh_from_source_url, headers=headers, timeout=20, verify=False)
+                
+                # Если прошло много времени, имитируем фоновую активность API
+                if time.time() - ghost_manager.last_ghost_activity > 180:
+                    threading.Thread(target=ghost_manager.perform_ghost_activity, daemon=True).start()
+                
+                root_text = r.text
+                root_resolved_url = r.url
+                if '#EXT-X-STREAM-INF' in root_text:
+                    nmu, aud = _pick_variant(root_text, root_resolved_url)
+                    selected_audio_playlist = aud
+                    return nmu
+                return root_resolved_url
+
+            def _async_refresh_worker():
+                try:
+                    # Рандомизация задержки для имитации реакции человека на ТВ
+                    time.sleep(random.uniform(0.2, 0.8))
+                    new_url = _do_source_refresh()
+                    with refresh_lock:
+                        nonlocal media_playlist_url, token_born_at, last_proactive_refresh
+                        media_playlist_url = new_url
+                        token_born_at = time.time()
+                        last_proactive_refresh = time.time()
+                    print(f"👻 [Ghosting] Токен обновлен в фоне. Сервер верит нам.")
+                except Exception as e:
+                    print(f"⚠️ [Ghosting] Refresh failure: {e}")
+                finally:
+                    is_refreshing_flag[0] = False
+
+            # Первичный fetch тоже должен переживать 429
             initial_text = resolved_initial_url = None
             for _attempt in range(8):
                 try:
-                    initial_text, resolved_initial_url = _fetch_text(current_playlist_url, timeout=25)
+                    # Проверка DNS перед запросом
+                    parsed_url = urllib.parse.urlparse(current_playlist_url)
+                    try:
+                        socket.gethostbyname(parsed_url.netloc.split(':')[0])
+                    except socket.gaierror:
+                        print(f"👻 [Ghosting] DNS Resolution failed for {parsed_url.netloc}")
+                        if _attempt < 3: 
+                            time.sleep(2)
+                            continue
+                        raise RuntimeError(f"DNS failed for {parsed_url.netloc}")
+
+                    headers = SourceIdentity.get_headers(current_playlist_url)
+                    r = http_session.get(current_playlist_url, headers=headers, timeout=25, verify=False)
+                    if r.status_code == 429:
+                        raise RuntimeError("429")
+                    initial_text, resolved_initial_url = r.text, r.url
                     break
                 except Exception as ie:
-                    if getattr(ie, 'is_429', False):
-                        wait = min(30.0, (getattr(ie, 'retry_after', 3.0) or 3.0)
-                                   * (1.5 ** _attempt)) + random.uniform(0, 1.5)
-                        print(f"⏳ [LIVEPIPE] initial 429; cooling down {wait:.1f}s")
-                        time.sleep(wait)
-                        continue
-                    raise
+                    wait = 2.0 * (1.5 ** _attempt) + random.uniform(0, 1)
+                    print(f"⏳ [Ghosting] initial 429/error; cooling down {wait:.1f}s")
+                    time.sleep(wait)
+            
             if initial_text is None:
-                # 429 не отпустил за разумное время — пробуем direct TS, если есть.
                 if direct_ts_url:
                     _stream_direct_ts(direct_ts_url)
                     return
-                raise RuntimeError('initial playlist unavailable (429)')
-            current_playlist_url = resolved_initial_url
-            media_playlist_url = resolved_initial_url
-            if '#EXT-X-STREAM-INF' in initial_text:
-                media_playlist_url, selected_audio_playlist = _pick_variant(initial_text, resolved_initial_url)
-                print(f"📡 [LIVEPIPE] using media playlist: {media_playlist_url[:120]}")
-            elif '#EXTM3U' not in initial_text:
-                raise RuntimeError('not a valid HLS playlist')
+                raise RuntimeError('initial playlist unavailable')
+
+            with refresh_lock:
+                current_playlist_url = resolved_initial_url
+                media_playlist_url = resolved_initial_url
+                if '#EXT-X-STREAM-INF' in initial_text:
+                    media_playlist_url, selected_audio_playlist = _pick_variant(initial_text, resolved_initial_url)
+                elif '#EXTM3U' not in initial_text:
+                    raise RuntimeError('not a valid HLS playlist')
+
+            token_born_at = time.time()
 
             while True:
                 loop_started = time.time()
+
+                if token_safe_ttl is not None and refresh_from_source_url:
+                    # Используем Pulse-Sync для вычисления идеального окна
+                    age = time.time() - token_born_at
+                    target_interval = pulse_sync.calculate_optimal_window(token_safe_ttl)
+                    
+                    if age >= target_interval and (time.time() - last_proactive_refresh) > 5.0 and not is_refreshing_flag[0]:
+                        is_refreshing_flag[0] = True
+                        threading.Thread(target=_async_refresh_worker, daemon=True).start()
+
                 try:
-                    text, resolved_media_url = _fetch_text(media_playlist_url, timeout=12)
-                    media_playlist_url = resolved_media_url
+                    with refresh_lock:
+                        target_url = media_playlist_url
+                    text, resolved_media_url = _fetch_text(target_url, timeout=12)
+                    with refresh_lock:
+                        media_playlist_url = resolved_media_url
                     consecutive_playlist_errors = 0
                     consecutive_429 = 0
                 except Exception as e:
@@ -1083,20 +1261,28 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
                     # надо снова сходить на исходный live URL и получить новый auth m3u8.
                     if ('404' in str(e) or '403' in str(e)) and refresh_from_source_url:
                         try:
+                            # --- ADAPTIVE PROFILER: изучаем срок жизни токена ---
+                            # Токен только что протух (404). Значит, он прожил примерно
+                            # (сейчас - token_born_at). Записываем это в историю и строим
+                            # безопасный интервал: чуть раньше самого КОРОТКОГО замера,
+                            # чтобы впредь освежать ДО 404 (см. блок PROFILER выше).
+                            lifetime = time.time() - token_born_at
+                            if 2.0 < lifetime < 3600.0:
+                                token_lifetimes.append(lifetime)
+                                shortest = min(token_lifetimes)
+                                # Безопасный TTL = 80% от самого короткого срока жизни,
+                                # но не меньше 3с (иначе задолбим сервер) — «втираемся
+                                # в доверие», а не спамим.
+                                token_safe_ttl = max(3.0, shortest * 0.8)
+                                print(f"🔎 [PROFILER] токен прожил ≈{lifetime:.0f}s → впредь освежаю каждые ≈{token_safe_ttl:.0f}s")
+
                             # ВАЖНО: refresh_from_source_url — это ВСЕГДА исходный
                             # стабильный Xtream .m3u8 (…/live/user/pass/id.m3u8).
-                            # Раньше мы перезаписывали его резолвнутым (redirect →
-                            # токенизированным CDN) URL, и когда токен протухал,
-                            # refresh бил по мёртвому токену → снова 404 → сваливались
-                            # на direct TS (отсюда повторы кадров и лаги).
-                            # Теперь всегда идём на исходный URL и получаем СВЕЖИЙ токен.
-                            root_text, root_resolved_url = _fetch_text(refresh_from_source_url, timeout=20)
-                            if '#EXT-X-STREAM-INF' in root_text:
-                                new_media_url, selected_audio_playlist = _pick_variant(root_text, root_resolved_url)
-                            else:
-                                new_media_url = root_resolved_url
+                            new_media_url = _do_source_refresh()
                             print(f"🔄 [LIVEPIPE] refreshed playlist with fresh token")
                             media_playlist_url = new_media_url
+                            token_born_at = time.time()
+                            last_proactive_refresh = time.time()
                             # После refresh прыгаем к свежему live edge: media-sequence
                             # мог сдвинуться, а старые сегменты уже мертвы. Так избегаем
                             # повторной 404-серии и «быстрого лага» на каждом обновлении.
@@ -1166,18 +1352,19 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
                 oldest_seq = segments[0]['seq']
 
                 if last_seq is None:
-                    # Стартуем с запасом ~4 сегмента (≈12с подушки). Этот forward-буфер
-                    # и есть маскировка лагов: пока mpv играет из него, протухание
-                    # токена / refresh playlist проходят незаметно для глаза.
-                    hold_back = max(2, min(4, len(segments) - 1))
-                    start_seq = max(oldest_seq, newest_seq - hold_back)
+                    # СТАРТ: заливаем МАКСИМАЛЬНУЮ подушку — всё доступное окно
+                    # плейлиста (обычно 6-10 сегментов ≈ 20-30с). Это ключ к тому,
+                    # чтобы у зрителя НЕ было буферизации: пока mpv играет из этих
+                    # 20-30с, любые паузы подачи от 404/refresh токена буфер НЕ
+                    # осушают. Раньше стартовали лишь на 4 сегмента (~12с) — их
+                    # съедала пара 404 подряд и начиналась буферизация.
+                    start_seq = oldest_seq
                     jump_to_edge = False
                 elif jump_to_edge:
                     # После 403/404 сегмента или refresh: старые (мёртвые) сегменты
-                    # пропускаем и продолжаем со свежего края, но только ВПЕРЁД,
-                    # чтобы не повторять уже показанные кадры.
-                    hold_back = max(2, min(4, len(segments) - 1))
-                    start_seq = max(oldest_seq, newest_seq - hold_back)
+                    # пропускаем, но берём МАКСИМУМ ещё живых сегментов из окна,
+                    # чтобы восполнить подушку, а не оставлять буфер тонким.
+                    start_seq = oldest_seq
                     if last_seq is not None and start_seq <= last_seq:
                         start_seq = last_seq + 1
                     jump_to_edge = False
@@ -1221,8 +1408,26 @@ class HLSProxyHandler(BaseHTTPRequestHandler):
                         if seg_resp.status_code != 200:
                             print(f"⚠️ [LIVEPIPE] segment HTTP {seg_resp.status_code}: {seg_url[:120]}")
                             if seg_resp.status_code in (403, 404):
-                                # Токен/окно сегмента протухли. Форсируем refresh playlist
-                                # и после него прыгаем прямо к свежему live edge — иначе
+                                # --- ADAPTIVE PROFILER: сегментный токен протух ---
+                                # Сегменты часто протухают раньше плейлиста, поэтому это
+                                # самый точный замер реального срока жизни токена.
+                                lifetime = time.time() - token_born_at
+                                if 2.0 < lifetime < 3600.0:
+                                    token_lifetimes.append(lifetime)
+                                    shortest = min(token_lifetimes)
+                                    token_safe_ttl = max(3.0, shortest * 0.8)
+                                    print(f"🔎 [PROFILER] сегмент-токен прожил ≈{lifetime:.0f}s → освежаю каждые ≈{token_safe_ttl:.0f}s")
+                                # Токен/окно сегмента протухли. Форсируем экстренный refresh плейлиста.
+                                if refresh_from_source_url:
+                                    try:
+                                        new_url = _do_source_refresh()
+                                        with refresh_lock:
+                                            media_playlist_url = new_url
+                                            token_born_at = time.time()
+                                        print(f"🔄 [LIVEPIPE] экстренный refresh токена после 404")
+                                    except Exception as refresh_err:
+                                        print(f"⚠️ [LIVEPIPE] emergency refresh failed: {refresh_err}")
+                                # Прыгаем прямо к свежему live edge — иначе
                                 # застрянем, доедая уже мёртвые URI (это и был «быстрый лаг»).
                                 jump_to_edge = True
                                 break
@@ -2136,19 +2341,20 @@ class IPTVCore(QObject):
                 try:
                     self.player['force-seekable'] = 'no'
                     self.player['demuxer-seekable-cache'] = 'no'
-                    # Умеренная forward-подушка ~15с: достаточно чтобы гасить
-                    # хиккапы (протухание токена / refresh / 404), но НЕ гигантская —
-                    # readahead=30+hysteresis=0 заставляли mpv качать 30с ЗАЛПОМ и
-                    # одновременно декодить 1080p → перегрузка и жёсткие лаги старта.
-                    self.player['cache-secs'] = '20'
-                    self.player['demuxer-readahead-secs'] = '15'
+                    # БОЛЬШАЯ forward-подушка ~40с: mpv ХРАНИТ всю подушку, которую
+                    # LIVEPIPE заливает на старте (всё окно плейлиста ≈20-30с). Это
+                    # и есть защита зрителя от буферизации: паузы подачи от 404/refresh
+                    # (1-2с) не осушают такой запас. hysteresis большой → mpv не
+                    # выкидывает буфер раньше времени и держит его полным.
+                    self.player['cache-secs'] = '60'
+                    self.player['demuxer-readahead-secs'] = '60'
                     self.player['demuxer-max-back-bytes'] = '0'
-                    # hysteresis небольшой (3с): докачка плавная, без залпа, но и
-                    # без простоя — буфер держится наполненным.
-                    self.player['demuxer-hysteresis-secs'] = '3'
-                    # cache-pause=no: при опустевшем буфере НЕ вставать на долгую
-                    # паузу-буферизацию, а продолжать с тем, что есть.
-                    self.player['cache-pause'] = 'no'
+                    self.player['demuxer-hysteresis-secs'] = '15'
+                    # cache-pause=yes: при опустевшем буфере mpv ЧЕСТНО встаёт на
+                    # короткую буферизацию и затем играет ПЛАВНО. cache-pause=no
+                    # давал слайд-шоу — mpv показывал кадры по мере их поступления
+                    # (медленнее реалтайма), вместо нормальной докачки.
+                    self.player['cache-pause'] = 'yes'
                     # Гарантируем нормальный тайминг для live (untimed off).
                     self.player['untimed'] = 'no'
                     self.player['video-sync'] = 'audio'
@@ -3390,16 +3596,16 @@ class IPTVCore(QObject):
                     p['demuxer-seekable-cache'] = 'no'
                 except Exception:
                     pass
-                # Умеренная forward-подушка ~15с: гасит хиккапы (протухание токена /
-                # refresh / 404), но не заставляет mpv качать залпом и захлёбываться
-                # на старте (было readahead=30+hysteresis=0 → жёсткие лаги).
-                p['cache-secs'] = '20'
+                # БОЛЬШАЯ forward-подушка ~40с: mpv хранит всё окно, что заливает
+                # LIVEPIPE на старте → паузы подачи от 404/refresh не осушают буфер,
+                # и зритель НЕ видит буферизацию.
+                p['cache-secs'] = '60'
                 p['demuxer-max-back-bytes'] = '0'
-                p['demuxer-readahead-secs'] = '15'
-                # hysteresis=3 → плавная докачка без залпа и без простоя.
-                p['demuxer-hysteresis-secs'] = '3'
+                p['demuxer-readahead-secs'] = '60'
+                p['demuxer-hysteresis-secs'] = '15'
                 try:
-                    p['cache-pause'] = 'no'
+                    # cache-pause=yes → честная буферизация вместо слайд-шоу.
+                    p['cache-pause'] = 'yes'
                     p['untimed'] = 'no'
                     p['video-sync'] = 'audio'
                 except Exception:
